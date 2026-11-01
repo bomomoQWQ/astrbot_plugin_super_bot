@@ -339,3 +339,4 @@ P0 三块已落地并通过单测（commit `7418ea8`）。
 | `python -m tests.e2e.sandbox_smoke` | Bay API 全能力（创建/执行/读写/销毁） | 8/8 |
 | `python -m tests.e2e.live_model` | 真模型回复 | 6/6 |
 | `python -m tests.e2e.live_chain` | **真模型 + 真沙箱** | 9/9 |
+| `python -m tests.e2e.reload` | 插件重载：真实例里跑到 `terminate()` → 重新 `initialize()` | 7/7 |
