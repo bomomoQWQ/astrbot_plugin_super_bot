@@ -1,0 +1,44 @@
+"""插件自带技能的"别让它烂掉"测试。
+
+技能是我们写给模型的行为说明书，改坏了不会报错、只会让它变笨，
+所以必须有一条测试盯着：能不能被发现、description 写没写、
+关键内容还在不在。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from superbot.skills import Skills
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+SHIPPED_SKILLS = PLUGIN_ROOT / "skills"
+
+
+def _load() -> Skills:
+    lib = Skills([SHIPPED_SKILLS])
+    lib.load()
+    return lib
+
+
+def test_shipped_skill_is_discoverable():
+    skills = _load().list()
+    assert skills, "插件没带任何技能，或者 skills/ 目录结构不对"
+    names = {s.name for s in skills}
+    assert "super-bot" in names, f"没扫到 super-bot 技能：{names}"
+
+
+def test_shipped_skill_has_a_usable_description():
+    """description 是模型在清单里唯一能看到的东西，含糊就等于不存在。"""
+    skill = _load().get("super-bot")
+    assert skill is not None
+    desc = skill.description
+    assert "superbot_dispatch" in desc, "说明里得点出工具名，模型才知道调什么"
+    assert "不要用" in desc or "不要" in desc, "得说清什么时候**别**用"
+    assert 20 <= len(desc) <= 200, f"说明长度不合适（{len(desc)}）"
+
+
+def test_shipped_skill_states_the_hard_rules():
+    text = _load().read("super-bot")
+    assert "不许编造" in text, "少了『不许编造结果』这条底线"
+    assert "/sb do" in text, "得告诉模型用户还有另一个入口"
