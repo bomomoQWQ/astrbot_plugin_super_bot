@@ -194,6 +194,31 @@ Dashboard 表单里用的是**中文短名**，配置文件里用的是英文键
 
 ---
 
+## 致谢
+
+**AstrBot** —— 这个插件是长在它上面的。写的时候大量直接读了它的源码来对齐行为
+（`Star` 的生命周期、`@filter` 的注册方式、`ToolSet`/`FunctionTool` 的调用约定、
+`ActiveEventRegistry` 的停止回调、技能系统的目录约定），每一处结论都在
+`docs/` 里标了 `file:line`。没有它这套东西无从谈起。
+
+**Shipyard Neo / Bay** —— 沙箱执行层。Worker 的工具循环跑在它提供的隔离环境里，
+`/v1/sandboxes`、`python/exec`、`filesystem`、`keepalive` 这几条接口是插件能"真干活"的前提。
+
+**《Super-agent 设计探索》** —— 本项目的设计出发点。准入、路由、编队、投递这条链路
+的取舍基本来自那篇文章，`docs/设计/30-decisions.md` 里逐条记了哪些照做、哪些改了主意。
+
+**《为人民服务》**（作者自己的上一个项目）—— `superbot/watchdog.py` 连同
+`STALL_THRESHOLD_SEC`、`MAX_RETRIES`、`RETRY_BACKOFF_SEC`、`MAX_ESCALATION`、
+`WATCHDOG_TICK_SEC` 这五个阈值都源自它。从 TypeScript 重写成了 Python，语义保持一致
+（唯一的主动偏离见 `docs/设计/30-decisions.md`）。
+
+**`docs/调查/_ref/`** —— 从上游镜像过来的参考实现，MIT 许可，版权归
+DeepSeek Harness Team，原样保留其 `LICENSE`。
+
+**依赖** —— 只有两个：`aiosqlite`、`httpx`。其余全部基于 Python 标准库与 AstrBot 自身。
+
+---
+
 ## 免责声明
 
 使用第三方协议实现（OneBot 等）接入 QQ 存在**账号风险**，这是平台规则决定的，
