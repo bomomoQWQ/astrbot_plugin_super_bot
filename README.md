@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" width="220" alt="Super Bot">
+</p>
+
 # Super Bot
 
 > AstrBot 插件 · 把"每条消息各回各的"改造成**有调度感的助手**
