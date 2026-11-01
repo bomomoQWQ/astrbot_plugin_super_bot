@@ -184,3 +184,18 @@ def test_index_text_lists_skills(tmp_path):
 def test_index_text_empty_when_no_skills(tmp_path):
     assert Skills([tmp_path]).load() == []
     assert Skills([tmp_path]).index_text() == ""
+
+
+def test_read_by_frontmatter_name(tmp_path):
+    """清单里显示的是 frontmatter 的 name；模型照抄它来读，必须能读到。"""
+    d = tmp_path / "Dir-Name"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: alias-name\ndescription: 别名技能\n---\n\n正文\n", encoding="utf-8"
+    )
+    lib = Skills([tmp_path])
+    lib.load()
+    assert [s.name for s in lib.list()] == ["alias-name"]
+    assert lib.get("alias-name") is not None, "按 frontmatter 名读不到"
+    assert lib.get("Dir-Name") is not None, "按目录名也读不到"
+    assert "正文" in lib.read("alias-name")

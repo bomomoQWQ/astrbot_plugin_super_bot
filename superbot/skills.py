@@ -128,6 +128,7 @@ class Skills:
         self.config_path = Path(config_path) if config_path else None
         self.max_bytes = max_bytes
         self._skills: dict[str, Skill] = {}
+        self._alias: dict[str, str] = {}
         self._problems: list[str] = []
 
     # -- 发现 -------------------------------------------------------------
@@ -151,6 +152,7 @@ class Skills:
     def load(self) -> list[Skill]:
         """扫一遍所有根目录，返回**可用**的技能（已按 active 过滤）。"""
         self._skills = {}
+        self._alias = {}
         self._problems = []
         active = self._active_map()
 
@@ -179,12 +181,17 @@ class Skills:
                 if not desc:
                     self._problems.append(f"{name}: 没有 description，模型不知道何时用它")
                     desc = "（没有说明）"
-                self._skills[name] = Skill(
+                self._skills[name] = skill = Skill(
                     name=meta.get("name") or name,
                     description=desc[:200],
                     path=md,
                     root=skill_dir,
                 )
+                # 模型看到的是 frontmatter 里的 name，读的时候可能照抄它；
+                # 目录名和它不一致时两个都得认，否则"清单里有、读不到"
+                self._alias[name] = name
+                if skill.name != name:
+                    self._alias.setdefault(skill.name, name)
         return self.list()
 
     def list(self) -> list[Skill]:
@@ -196,11 +203,15 @@ class Skills:
         return list(self._problems)
 
     def get(self, name: str) -> Skill | None:
-        if name in self._skills:
-            return self._skills[name]
+        key = name.strip().strip("/")
+        if key in self._alias:
+            return self._skills.get(self._alias[key])
+        if key in self._skills:
+            return self._skills[key]
         # 容忍模型写成 "skills/xxx/SKILL.md"、"xxx/SKILL.md"、"skills/xxx"
-        parts = [p for p in name.strip().strip("/").split("/") if p]
-        for part in parts:
+        for part in [p for p in key.split("/") if p]:
+            if part in self._alias:
+                return self._skills.get(self._alias[part])
             if part in self._skills:
                 return self._skills[part]
         return None
