@@ -126,6 +126,23 @@ class Router:
             return sum(len(q) for q in self._pending.values())
         return len(self._pending.get(thread_key, ()))
 
+    def clear(self, thread_key: str | None = None) -> int:
+        """丢弃**还没开始跑**的 Trigger，返回丢弃条数。
+
+        用在 ``/stop`` 上：只取消正在跑的工单还不够——排队的下一批会紧接着
+        又跑起来，用户会觉得"没停下来"。所以要把队列也清掉。
+
+        正在评估中的那一批不受影响（它已经出队了），由 Worker 的取消负责。
+        """
+        if thread_key is None:
+            dropped = sum(len(q) for q in self._pending.values())
+            self._pending.clear()
+            self._requeued.clear()
+            return dropped
+        queue = self._pending.pop(thread_key, [])
+        self._requeued.pop(thread_key, None)
+        return len(queue)
+
     def is_evaluating(self, thread_key: str) -> bool:
         return thread_key in self._evaluating
 

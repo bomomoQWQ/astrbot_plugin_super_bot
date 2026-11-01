@@ -260,3 +260,63 @@ async def test_snapshot():
     assert snap["replies"] == 2
     assert snap["pending"] == 0
     assert snap["evaluating"] == 0
+
+
+# ---------------------------------------------------------------------------
+# clear（给 /stop 用）
+# ---------------------------------------------------------------------------
+
+
+async def test_clear_drops_pending():
+    r = Router(evaluate=Evaluator())
+    for i in range(3):
+        r.enqueue(_trig(f"t{i}"))
+    assert r.clear() == 3
+    assert r.pending() == 0
+
+
+async def test_clear_one_thread_only():
+    r = Router(evaluate=Evaluator())
+    r.enqueue(_trig("a1", thread="A"))
+    r.enqueue(_trig("a2", thread="A"))
+    r.enqueue(_trig("b1", thread="B"))
+    assert r.clear("A") == 2
+    assert r.pending("A") == 0
+    assert r.pending("B") == 1
+
+
+async def test_clear_unknown_thread_returns_zero():
+    r = Router(evaluate=Evaluator())
+    assert r.clear("nope") == 0
+
+
+async def test_clear_does_not_touch_running_batch():
+    """已经出队、正在评估的那一批不受 clear 影响（由 Worker 取消负责）。"""
+    gate = asyncio.Event()
+
+    async def evaluate(batch: list[Trigger]) -> list[Reply]:
+        await gate.wait()
+        return []
+
+    r = Router(evaluate=evaluate, coalesce=0)
+    r.enqueue(_trig("t0"))
+    task = asyncio.create_task(r.run_once())
+    await asyncio.sleep(0)
+
+    r.enqueue(_trig("t1"))
+    assert r.clear() == 1  # 只清掉排队的那条
+    gate.set()
+    await task
+    assert r.stats.evals == 1
+    assert r.pending() == 0
+
+
+async def test_clear_resets_requeue_budget():
+    ev = Evaluator(fail_times=99)
+    r = Router(evaluate=ev, max_requeues=5)
+    r.enqueue(_trig("t0"))
+    await r.run_once()  # 失败 → 重投，预算用掉 1
+    assert r.pending() == 1
+    r.clear()
+    assert r.pending() == 0
+    assert r._requeued == {}  # 预算也清掉，下次重新算

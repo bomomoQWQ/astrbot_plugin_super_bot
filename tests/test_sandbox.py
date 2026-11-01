@@ -31,7 +31,8 @@ def _client(handler) -> httpx.AsyncClient:
 # ---------------------------------------------------------------------------
 
 
-async def test_create_sandbox_sends_idempotency_key():
+async def test_create_sandbox_default_has_no_idempotency_key():
+    """默认不带幂等键 —— Bay 的幂等缓存比沙箱活得久，复用会拿到已销毁的 id。"""
     seen: dict = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -51,8 +52,22 @@ async def test_create_sandbox_sends_idempotency_key():
     assert seen["method"] == "POST"
     assert seen["path"] == "/v1/sandboxes"
     assert seen["auth"] == f"Bearer {KEY}"
-    assert seen["idem"] == "ticket-tk-1"  # 幂等键由 ticket 派生
+    assert seen["idem"] is None, "默认不该带幂等键"
     assert seen["body"] == {"profile": "python-default", "ttl": 600}
+
+
+async def test_create_sandbox_can_opt_into_idempotency():
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["idem"] = req.headers.get("idempotency-key")
+        return httpx.Response(201, json={"id": "s1"})
+
+    sb = BaySandbox(endpoint="http://bay:8114", api_key=KEY, ttl=600)
+    sb._client = _client(handler)
+    await sb.create(ticket_id="tk-1", idempotent=True)
+    await sb._client.aclose()
+    assert seen["idem"] == "ticket-tk-1"
 
 
 async def test_create_without_ttl_omits_field():

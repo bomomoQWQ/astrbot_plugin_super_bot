@@ -59,7 +59,21 @@ from superbot.sandbox import BaySandbox, SandboxPort  # noqa: E402
 from superbot.store import DispositionRow, Store  # noqa: E402
 from superbot.synthetic import make_synthetic_event  # noqa: E402
 from superbot.thread_key import thread_key, ticket_id_from_eval, trigger_id  # noqa: E402
-from superbot.worker import Assignment, Ticket, WorkerPool, WorkerResult  # noqa: E402
+from superbot.worker import (  # noqa: E402
+    Assignment,
+    Outcome,
+    Ticket,
+    WorkerPool,
+    WorkerResult,
+)
+
+# 让框架自带的 /stop 能停到我们：把每个会话的活跃任务登记进 ActiveEventRegistry。
+# 这个模块是 AstrBot 内置命令用的同一个（builtin_stars/builtin_commands/commands/
+# conversation.py:117-122），所以 `/stop` 会顺着它找到我们，不需要我们自己拦截命令。
+try:
+    from astrbot.core.utils.active_event_registry import active_event_registry
+except Exception:  # noqa: BLE001
+    active_event_registry = None  # type: ignore[assignment]
 
 PLUGIN_NAME = "astrbot_plugin_super_bot"
 PLUGIN_VERSION = "0.1.0"
@@ -84,6 +98,12 @@ EVAL_DELAY_ENV = "SUPERBOT_EVAL_DELAY"
 
 STUB_NEEDLE = "sb:"
 """桩评估器只对这些消息回复，其余一律忽略——避免"每条群消息都插一句"。"""
+
+WORKER_DELAY_ENV = "SUPERBOT_WORKER_DELAY"
+"""桩 Worker 的假耗时（秒）。默认取 ``min(0.3, eval_delay)``。
+
+测试 ``/stop`` 时要把它调大（比如 30），否则任务结束得太快、来不及取消。
+"""
 
 __all__ = ["SuperBotPlugin"]
 
@@ -201,6 +221,10 @@ class SuperBotPlugin(star.Star):
         self._workers: WorkerPool | None = None
         self._sandbox: SandboxPort | None = None
         self._sandbox_ids: set[str] = set()
+        # 停止钩子：umo -> 合成事件；umo -> 该会话在跑的 ticket；ticket -> assignment
+        self._stop_events: dict[str, Any] = {}
+        self._umo_tickets: dict[str, set[str]] = {}
+        self._assignment_ids: dict[str, str] = {}
         self._stop: asyncio.Event | None = None
         self._router_task: asyncio.Task | None = None
         self._ticket_ctx: dict[str, dict[str, Any]] = {}
@@ -288,6 +312,18 @@ class SuperBotPlugin(star.Star):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("%s worker shutdown failed: %s", LOG_TAG, exc)
             self._workers = None
+
+        # 把登记进 registry 的合成事件都摘掉，别让 /stop 指向已经没了的东西
+        if active_event_registry is not None:
+            for event in list(self._stop_events.values()):
+                try:
+                    active_event_registry.unregister(event)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._stop_events.clear()
+        self._umo_tickets.clear()
+        self._assignment_ids.clear()
+        self._ticket_ctx.clear()
 
         if self._store is not None:
             try:
@@ -423,7 +459,7 @@ class SuperBotPlugin(star.Star):
         }
 
         if self._workers is not None:
-            await self._workers.submit(
+            assignment_id = await self._workers.submit(
                 Ticket(
                     id=ticket_id,
                     thread_key=thread,
@@ -431,6 +467,7 @@ class SuperBotPlugin(star.Star):
                     created_at=time.time(),
                 )
             )
+            self._register_stop_hook(batch[-1].umo, ticket_id, assignment_id)
             logger.info(
                 "%s ticket %s dispatched (batch=%d)", LOG_TAG, ticket_id[:8], len(batch)
             )
@@ -484,7 +521,7 @@ class SuperBotPlugin(star.Star):
             "plan": plan,
         }
         if self._workers is not None:
-            await self._workers.submit(
+            assignment_id = await self._workers.submit(
                 Ticket(
                     id=ticket_id,
                     thread_key=thread,
@@ -492,6 +529,7 @@ class SuperBotPlugin(star.Star):
                     created_at=time.time(),
                 )
             )
+            self._register_stop_hook(umo, ticket_id, assignment_id)
             logger.info(
                 "%s ticket %s dispatched (live, batch=%d)",
                 LOG_TAG,
@@ -509,22 +547,53 @@ class SuperBotPlugin(star.Star):
         ctx = self._ticket_ctx.get(ticket.id) or {}
 
         if self._sandbox is None:
-            await asyncio.sleep(min(0.3, _eval_delay()))
+            await asyncio.sleep(_worker_delay())
             if ctx.get("plan"):
                 return WorkerResult(text=ctx["plan"], ok=True)
             return WorkerResult(text=f"ECHO-BATCH:{ctx.get('batch', 0)}", ok=True)
 
         sandbox_id: str | None = None
         try:
-            sandbox_id = await self._sandbox.create(ticket_id=ticket.id)
-            self._sandbox_ids.add(sandbox_id)
-            logger.info("%s sandbox %s created for ticket %s", LOG_TAG, sandbox_id, ticket.id[:8])
+            for attempt in (1, 2):
+                sandbox_id = await self._sandbox.create(ticket_id=ticket.id)
+                self._sandbox_ids.add(sandbox_id)
+                logger.info(
+                    "%s sandbox %s created for ticket %s (attempt %d)",
+                    LOG_TAG,
+                    sandbox_id,
+                    ticket.id[:8],
+                    attempt,
+                )
 
-            res = await self._sandbox.exec_python(sandbox_id, "print(6*7)")
+                res = await self._sandbox.exec_python(sandbox_id, "print(6*7)")
+                if res.ok:
+                    break
+
+                # 「沙箱在创建与执行之间就没了」是真实存在的情况（预热池轮转、
+                # TTL 到期、被 GC）。这种情况下重试同一个 id 没有意义，要重建。
+                gone = "not found" in (res.error or "").lower()
+                logger.warning(
+                    "%s sandbox exec failed (attempt %d, gone=%s): %s",
+                    LOG_TAG,
+                    attempt,
+                    gone,
+                    res.error,
+                )
+                if attempt == 2:
+                    logger.error("%s sandbox exec gave up: %s", LOG_TAG, res.error)
+                    return WorkerResult(text=f"沙箱执行失败: {res.error}", ok=False)
+
+                # 先收拾掉这个不健康的沙箱，再重建
+                self._sandbox_ids.discard(sandbox_id)
+                try:
+                    await self._sandbox.destroy(sandbox_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                sandbox_id = None
+                if not gone:
+                    await asyncio.sleep(1.0)
+
             out = (res.output or "").strip()
-            if not res.ok:
-                return WorkerResult(text=f"沙箱执行失败: {res.error}", ok=False)
-
             await self._sandbox.write_file(sandbox_id, "ticket.txt", ticket.id)
             plan = ctx.get("plan") or ""
             text = f"{plan}（沙箱 6×7={out}）" if plan else f"SANDBOX-OK:{out}"
@@ -550,12 +619,33 @@ class SuperBotPlugin(star.Star):
             LOG_TAG,
             assignment.ticket.id[:8],
             assignment.outcome.value if assignment.outcome else "?",
-            assignment.text[:40],
+            assignment.text[:200],
         )
         self._ticket_ctx.pop(assignment.ticket.id, None)
-        if not umo or not assignment.text:
+        self._unregister_stop_hook(assignment.ticket.id)
+        if not umo:
             return
-        if assignment.outcome and assignment.outcome.value != "ok":
+
+        # 失败要说话：Router 已经决定要回了，结果 Worker 挂了，静默会让用户
+        # 以为"它不想理我"。取消（/stop）则不该补话。
+        if assignment.outcome is Outcome.FAILED:
+            logger.error(
+                "%s ticket %s failed: %s",
+                LOG_TAG,
+                assignment.ticket.id[:8],
+                assignment.error or assignment.text,
+            )
+            await self._emit(
+                [
+                    Reply(
+                        umo=umo,
+                        text="（这次没执行成功，稍后再试）",
+                        thread_key=assignment.ticket.thread_key,
+                    )
+                ]
+            )
+            return
+        if assignment.outcome is Outcome.CANCELLED or not assignment.text:
             return
         await self._emit(
             [
@@ -565,6 +655,92 @@ class SuperBotPlugin(star.Star):
                     thread_key=assignment.ticket.thread_key,
                 )
             ]
+        )
+
+    # -- 停止钩子：让框架的 /stop 能停到我们 -------------------------------
+
+    def _register_stop_hook(self, umo: str, ticket_id: str, assignment_id: str) -> None:
+        """把一个会话的活跃任务登记进 ``ActiveEventRegistry``。
+
+        为什么这样做而不自己拦截 ``/stop``：内置命令走的是
+        ``active_event_registry.request_agent_stop_all(umo)``
+        （builtin_stars/builtin_commands/commands/conversation.py:119），
+        它遍历该 UMO 下的活跃事件，调 ``register_agent_stop_callback`` 注册的回调。
+        登记进去，``/stop`` 就**天然**能找到我们，而且回执里的任务计数也是对的
+        （不会出现"插件停了但提示说 0 个任务"）。
+
+        每个会话只登记**一个**合成事件（不是每个工单一个）：语义本来就是
+        "停掉这个会话里正在跑的所有事"。
+        """
+        if active_event_registry is None:
+            return
+        self._umo_tickets.setdefault(umo, set()).add(ticket_id)
+        self._assignment_ids[ticket_id] = assignment_id
+
+        if umo in self._stop_events:
+            return
+        try:
+            event = make_synthetic_event(self.context, umo, "[super-bot task]")
+            # 回调是同步的（registry 直接调用），只能 schedule
+            active_event_registry.register(event)
+            active_event_registry.register_agent_stop_callback(
+                event, lambda: asyncio.create_task(self._cancel_umo(umo))
+            )
+            self._stop_events[umo] = event
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s register stop hook failed: %s", LOG_TAG, exc)
+
+    def _unregister_stop_hook(self, ticket_id: str) -> None:
+        self._assignment_ids.pop(ticket_id, None)
+        for umo, tickets in list(self._umo_tickets.items()):
+            tickets.discard(ticket_id)
+            if tickets:
+                continue
+            self._umo_tickets.pop(umo, None)
+            event = self._stop_events.pop(umo, None)
+            if event is not None and active_event_registry is not None:
+                try:
+                    active_event_registry.unregister(event)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    async def _cancel_umo(self, umo: str) -> None:
+        """``/stop`` 的实际动作：取消在跑的工单 + 清空还在排队的 Trigger。
+
+        两步都要做：只取消在跑的，排队的下一批会紧接着又跑起来，
+        用户会觉得"根本没停下"。
+        """
+        tickets = list(self._umo_tickets.get(umo, ()))
+
+        # 1) 清掉还在排队的 Trigger（按这些工单所属的 Thread 清）
+        threads = {
+            ctx["thread_key"]
+            for tid in tickets
+            if (ctx := self._ticket_ctx.get(tid)) and ctx.get("thread_key")
+        }
+        dropped = 0
+        if self._router is not None:
+            if threads:
+                for thread in threads:
+                    dropped += self._router.clear(thread)
+            elif not tickets:
+                # 没有登记工单（可能是纯排队阶段）→ 整体清一次
+                dropped = self._router.clear()
+
+        # 2) 取消正在跑的工单
+        cancelled = 0
+        if self._workers is not None:
+            for ticket_id in tickets:
+                aid = self._assignment_ids.get(ticket_id)
+                if aid and await self._workers.cancel(aid):
+                    cancelled += 1
+
+        logger.info(
+            "%s stop umo=%s cancelled=%d dropped_pending=%d",
+            LOG_TAG,
+            umo,
+            cancelled,
+            dropped,
         )
 
     async def _emit(self, replies: list[Reply]) -> None:
@@ -631,8 +807,24 @@ def _eval_delay() -> float:
         return 0.6
 
 
+def _worker_delay() -> float:
+    """桩 Worker 的假耗时。"""
+    raw = os.environ.get(WORKER_DELAY_ENV)
+    if raw is None:
+        return min(0.3, _eval_delay())
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return min(0.3, _eval_delay())
+
+
 def _sandbox_enabled() -> bool:
-    return (os.environ.get(SANDBOX_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+    return (os.environ.get(SANDBOX_ENV) or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _bay_key() -> str | None:

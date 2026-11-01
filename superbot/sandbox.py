@@ -145,11 +145,24 @@ class BaySandbox:
 
     # -- Sandbox 生命周期 -------------------------------------------------
 
-    async def create(self, *, ticket_id: str, ttl: int | None = None) -> str:
+    async def create(
+        self, *, ticket_id: str, ttl: int | None = None, idempotent: bool = False
+    ) -> str:
         """创建一个沙箱，返回 sandbox_id。
 
-        ``Idempotency-Key`` 用 ticket_id：同一张工单重复创建只会有一个沙箱
-        （Bay 支持该键，见 doc/bay_api_v1.md「幂等性支持」）。
+        Args:
+            ticket_id: 用于幂等键（当 ``idempotent=True``）与日志。
+            ttl: 覆盖默认 TTL。
+            idempotent: 是否带 ``Idempotency-Key``。
+
+        ⚠ ``idempotent`` 默认 **False**，这是踩出来的：
+
+        Bay 的幂等缓存**比沙箱活得久**。用固定的 ticket_id 当幂等键，
+        同一条工单第二次开沙箱时会拿到缓存里那个**已经被销毁**的 sandbox_id，
+        随后的执行就是 404 ``Sandbox not found``。
+
+        所以这里只在"同一次派工内的重试"场景才开幂等（由调用方传 True），
+        默认每次都建新的。
         """
         body: dict[str, Any] = {"profile": self.profile}
         use_ttl = self.ttl if ttl is None else ttl
@@ -164,7 +177,8 @@ class BaySandbox:
             own_client = True
         try:
             headers = self._headers()
-            headers["Idempotency-Key"] = f"ticket-{ticket_id}"
+            if idempotent:
+                headers["Idempotency-Key"] = f"ticket-{ticket_id}"
             try:
                 resp = await client.post(url, headers=headers, json=body)
             except Exception as exc:  # noqa: BLE001
