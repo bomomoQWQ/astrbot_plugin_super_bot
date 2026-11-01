@@ -215,3 +215,46 @@ async def test_close_cancels_everything():
     await asyncio.sleep(0.02)
     await pool.close()
     assert pool.running() == 0
+
+
+# ---------------------------------------------------------------------------
+# wait（把 Worker 当同步工具用）
+# ---------------------------------------------------------------------------
+
+
+async def test_wait_returns_assignment_when_done():
+    runner = Runner(delay=0.05)
+    pool = WorkerPool(run=runner)
+    aid = await pool.submit(_ticket())
+    done = await pool.wait(aid, timeout=5)
+    assert done is not None
+    assert done.outcome is Outcome.OK
+    assert done.state is AssignmentState.ENDED
+
+
+async def test_wait_returns_none_on_timeout_without_cancelling():
+    runner = Runner(delay=5)
+    pool = WorkerPool(run=runner)
+    aid = await pool.submit(_ticket())
+    assert await pool.wait(aid, timeout=0.05) is None
+    # 超时不该把任务干掉
+    assert pool.get(aid) is not None
+    assert not pool.get(aid).done
+    await pool.cancel_all()
+
+
+async def test_wait_unknown_assignment_returns_none():
+    pool = WorkerPool(run=Runner())
+    assert await pool.wait("nope", timeout=1) is None
+
+
+async def test_wait_returns_cancelled_assignment():
+    runner = Runner(delay=5)
+    pool = WorkerPool(run=runner)
+    aid = await pool.submit(_ticket())
+    await asyncio.sleep(0.01)
+    waiter = asyncio.create_task(pool.wait(aid, timeout=5))
+    await asyncio.sleep(0.02)
+    await pool.cancel(aid)
+    done = await asyncio.wait_for(waiter, timeout=5)
+    assert done is not None and done.outcome is Outcome.CANCELLED

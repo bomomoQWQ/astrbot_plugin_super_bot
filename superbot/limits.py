@@ -94,3 +94,9 @@ HOUSEKEEPING_INTERVAL_SEC = 6 * 3600.0
 
 TICKET_RETENTION_DAYS = 90
 """工单（含它的事实）的保留天数。这是审计数据，留久一点但也不能永远留。"""
+
+TOOL_WAIT_SEC = 90.0
+"""模型调用 ``superbot_dispatch`` 工具时，最多等 Worker 跑多久（秒）。
+
+超时**不取消**任务——只是把结果改成"跑完直接发消息"，否则用户就白等了。
+"""

@@ -209,6 +209,31 @@ class WorkerPool:
     def get(self, assignment_id: str) -> Assignment | None:
         return self._assignments.get(assignment_id)
 
+    async def wait(self, assignment_id: str, timeout: float | None = None) -> Assignment | None:
+        """等某个 assignment 结束，返回它（超时返回 None）。
+
+        用途：把 Worker 当成"同步工具"用——模型调一个工具，工具等任务跑完再把
+        结果交回去。注意超时**不会**取消任务，调用方要自己决定后续怎么办
+        （我们这边是把它改成"跑完直接发消息"）。
+        """
+        task = self._tasks.get(assignment_id)
+        a = self._assignments.get(assignment_id)
+        if task is None or a is None:
+            return None
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            # 任务被 /stop 取消时，await 这边也会收到 CancelledError；
+            # 只有 assignment 真的落了终态才算"等到了"
+            if a.done:
+                return a
+            raise
+        except Exception:  # noqa: BLE001
+            pass
+        return a
+
     def running(self) -> int:
         return len([a for a in self._assignments.values() if a.state is AssignmentState.RUNNING])
 

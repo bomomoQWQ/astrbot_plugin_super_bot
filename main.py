@@ -196,6 +196,25 @@ HOUSEKEEPING_ENV = "SUPERBOT_HOUSEKEEPING_SEC"
 RETRY_BACKOFF_ENV = "SUPERBOT_RETRY_BACKOFF_SEC"
 """重试退避序列（逗号分隔秒），默认 ``30,60,120``。测试会调成零点几秒。"""
 
+TOOL_WAIT_ENV = "SUPERBOT_TOOL_WAIT_SEC"
+"""llm_tool 等 Worker 跑完的上限（秒），默认 90。超时不取消任务，改成跑完直接发。"""
+
+HELP_TEXT = """/sb —— Super Bot
+
+/sb              看状态（同 /sb status）
+/sb do <任务>     跳过判断，直接派给沙箱子代理去干
+/sb help         看这段说明"""
+
+
+def _tool_wait_timeout() -> float:
+    raw = os.environ.get(TOOL_WAIT_ENV)
+    if not raw:
+        return limits.TOOL_WAIT_SEC
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return limits.TOOL_WAIT_SEC
+
 SANDBOX_HOLD_ENV = "SUPERBOT_SANDBOX_HOLD_SEC"
 """Worker 在沙箱里**多待**几秒再销毁（默认 0）。
 
@@ -689,12 +708,126 @@ class SuperBotPlugin(star.Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s reconcile failed: %s", LOG_TAG, exc)
 
-    # -- 状态命令 -----------------------------------------------------------
+    # -- 命令入口（全部收在 /sb 下面，不往全局命名空间里扔裸命令）---------
 
     @filter.command("sb")
     async def sb_command(self, event: AstrMessageEvent):
-        """``/sb status`` —— 看一眼系统现在在干嘛。"""
-        yield event.plain_result(await self._status_text())
+        """``/sb [status|do|help]`` —— 状态 / 直接派活 / 帮助。"""
+        parts = event.message_str.strip().split(maxsplit=2)
+        sub = parts[1].lower() if len(parts) > 1 else "status"
+        rest = parts[2].strip() if len(parts) > 2 else ""
+
+        if sub in ("status", "st", ""):
+            yield event.plain_result(await self._status_text())
+            return
+        if sub in ("do", "run", "task"):
+            yield event.plain_result(await self._do_direct(event, rest))
+            return
+        if sub in ("help", "?", "-h", "--help"):
+            yield event.plain_result(HELP_TEXT)
+            return
+        yield event.plain_result(f"没有这个子命令：{sub}\n\n{HELP_TEXT}")
+
+    async def _do_direct(self, event: AstrMessageEvent, task: str) -> str:
+        """``/sb do <任务>``：跳过 Router 的模型判断，直接开票给 Worker。"""
+        if not task:
+            return "用法：/sb do <任务>\n例：/sb do 算一下 987654321×123456789"
+        if self._workers is None:
+            return "Worker 没就绪，暂时不能派活。"
+        thread = thread_key(to_view(event), reply_ref=_reply_ref(event))
+        ticket_id = await self._dispatch_task(
+            task, umo=event.unified_msg_origin, thread=thread, deliver="outbox"
+        )
+        if ticket_id is None:
+            return "派活失败，看一下日志。"
+        return f"收到，去办了（工单 {ticket_id[:8]}）。干完我发给你。"
+
+    # -- 给原生 agent 的路由工具 --------------------------------------------
+
+    @filter.llm_tool(name="superbot_dispatch")
+    async def superbot_dispatch(self, event: AstrMessageEvent, task: str = "") -> str:
+        """把需要真正动手的任务派给沙箱子代理执行，并等它把结果带回来。
+
+        什么时候该用：用户要你**真去执行**——算数、跑代码、处理数据、看环境、
+        下载或转换文件。这种活你自己答不出来，必须交给能跑的沙箱。
+
+        什么时候别用：闲聊、寒暄、解释概念、你凭上下文就能回答的问题。
+        也别用它来复述用户的话——派下去的任务要写清楚要做什么。
+
+        Args:
+            task(string): 要执行的任务，写清楚目标和参数
+        """
+        task = (task or "").strip() or event.message_str.strip()
+        if not task:
+            return "没看懂要做什么，请你直接说清楚要执行的任务。"
+        if self._workers is None:
+            return "沙箱子代理没就绪，这次派不出去。"
+
+        thread = thread_key(to_view(event), reply_ref=_reply_ref(event))
+        ticket_id = await self._dispatch_task(
+            task, umo=event.unified_msg_origin, thread=thread, deliver="tool"
+        )
+        if ticket_id is None:
+            return "派活失败。"
+
+        assignment_id = self._assignment_ids.get(ticket_id, "")
+        done = await self._workers.wait(assignment_id, timeout=_tool_wait_timeout())
+        if done is None:
+            # 超时。先确认是不是刚好在这一刻跑完了（那样直接给结果）
+            late = self._workers.get(assignment_id)
+            if late is not None and late.outcome is not None:
+                if late.outcome is Outcome.FAILED:
+                    return f"执行失败：{(late.error or late.text or '未知原因')[:300]}"
+                return late.text or "（执行完了，但没有输出）"
+            # 真还在跑：切成"跑完直接发消息"，结果不会丢
+            ctx = self._ticket_ctx.get(ticket_id)
+            if ctx is not None:
+                ctx["deliver"] = "outbox"
+            return "任务还在跑，比预期久；跑完我会直接把结果发给你，不用重复问。"
+        if done.outcome is Outcome.FAILED:
+            return f"执行失败：{(done.error or done.text or '未知原因')[:300]}"
+        if done.outcome is Outcome.CANCELLED:
+            return "任务被取消了。"
+        return done.text or "（执行完了，但没有输出）"
+
+    async def _dispatch_task(
+        self, task: str, *, umo: str, thread: str, deliver: str = "outbox"
+    ) -> str | None:
+        """开票 + 落库 + 挂 watchdog + 提交给 Worker。
+
+        ``deliver`` 决定结果怎么回去：
+
+        - ``outbox``：Worker 说完，插件自己发消息（Router / ``/sb do`` 用）
+        - ``tool``：结果交还给调用它的模型，由模型组织回复（llm_tool 用）
+        """
+        if self._workers is None:
+            return None
+        ticket_id = ticket_id_from_eval(f"{thread}:{time.time():.6f}:{task[:40]}")
+        self._ticket_ctx[ticket_id] = {
+            "umo": umo,
+            "thread_key": thread,
+            "task": task,
+            "batch": 1,
+            "deliver": deliver,
+        }
+        await self._open_ticket(ticket_id, thread, f"direct:{task[:40]}")
+        assignment_id = await self._workers.submit(
+            Ticket(
+                id=ticket_id,
+                thread_key=thread,
+                mandate="direct",
+                created_at=time.time(),
+            )
+        )
+        self._register_stop_hook(umo, ticket_id, assignment_id)
+        logger.info(
+            "%s direct dispatch ticket=%s deliver=%s task=%r",
+            LOG_TAG,
+            ticket_id[:8],
+            deliver,
+            task[:60],
+        )
+        return ticket_id
 
     async def _status_text(self) -> str:
         lines = ["Super Bot 状态"]
@@ -1137,6 +1270,10 @@ class SuperBotPlugin(star.Star):
         if not umo:
             return
 
+        # deliver=tool 时结果由模型自己组织回复，这里只记账、不抢话
+        deliver = ctx.get("deliver", "outbox")
+        speaks = deliver != "tool"
+
         # 失败要说话：Router 已经决定要回了，结果 Worker 挂了，静默会让用户
         # 以为"它不想理我"。取消（/stop）则不该补话。
         if assignment.outcome is Outcome.FAILED:
@@ -1147,6 +1284,8 @@ class SuperBotPlugin(star.Star):
                 assignment.error or assignment.text,
             )
             await self._fact(ticket_id, "worker_failed", (assignment.error or "")[:200])
+            if not speaks:
+                return
             await self._emit(
                 [
                     Reply(
@@ -1165,6 +1304,8 @@ class SuperBotPlugin(star.Star):
             return
 
         await self._fact(ticket_id, "delivered", assignment.text[:200])
+        if not speaks:
+            return
         await self._emit(
             [
                 Reply(

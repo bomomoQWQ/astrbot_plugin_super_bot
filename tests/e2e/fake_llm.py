@@ -77,6 +77,25 @@ class FakeLLM:
         self.requests.clear()
 
 
+def _tool_outputs(messages: list[dict]) -> list[str]:
+    """取出**最后一轮**的工具执行结果（role=tool 的消息）。
+
+    只认最后一条 user 消息之后的——AstrBot 会带上整段会话历史，
+    历史里那些旧工具结果如果不排除掉，会被误判成"这一轮已经调过工具了"。
+    """
+    tail: list[dict] = []
+    for msg in reversed(messages or []):
+        if msg.get("role") == "user":
+            break
+        if msg.get("role") == "tool":
+            tail.append(msg)
+    out: list[str] = []
+    for msg in reversed(tail):
+        content = msg.get("content")
+        out.append(content if isinstance(content, str) else str(content))
+    return out
+
+
 def _reply_text(prompt: str) -> str:
     if m := _ECHO_RE.search(prompt):
         return f"ECHO:{m.group('tag')}"
@@ -124,10 +143,18 @@ def build_app(state: FakeLLM) -> web.Application:
         if m := _SLOW_RE.search(prompt):
             await asyncio.sleep(float(m.group("sec")))
 
-        # 工具调用分支（当前仅用于占位，后续测 Worker 工具循环时启用）
+        # 工具调用分支：**只调一次**。第二次请求里已经有 role=tool 的结果，
+        # 再调一次就会无限循环（AstrBot 会把 [[tool:...]] 留在上下文里）。
         tool_name = None
-        if m := _TOOL_RE.search(prompt):
-            tool_name = m.group("name")
+        tool_outputs = _tool_outputs(messages)
+        if not tool_outputs:
+            if m := _TOOL_RE.search(prompt):
+                tool_name = m.group("name")
+
+        text = _reply_text(prompt)
+        if tool_outputs:
+            # 把工具结果原样带回去，e2e 才能断言"结果真的流到模型了"
+            text = f"FAKE-LLM-OK 工具说：{tool_outputs[-1][:120]}"
 
         if body.get("stream"):
             resp = web.StreamResponse(
@@ -161,7 +188,7 @@ def build_app(state: FakeLLM) -> web.Application:
                 }
                 await resp.write(f"data: {json.dumps(chunk)}\n\n".encode())
             else:
-                await resp.write(_sse_chunk(_reply_text(prompt), model, True).encode())
+                await resp.write(_sse_chunk(text, model, True).encode())
             done = {
                 "id": "chatcmpl-fake",
                 "object": "chat.completion.chunk",
@@ -174,7 +201,6 @@ def build_app(state: FakeLLM) -> web.Application:
             await resp.write_eof()
             return resp
 
-        text = _reply_text(prompt)
         if tool_name:
             message: dict = {
                 "role": "assistant",

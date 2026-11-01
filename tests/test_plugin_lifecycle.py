@@ -525,3 +525,114 @@ async def test_prune_once_cleans_old_rows(plugin, plugin_mod):
         assert (await plugin._store.counts())["disposition"] == 0
     finally:
         await plugin.terminate()
+
+
+# ---------------------------------------------------------------------------
+# /sb 子命令与直通派活
+# ---------------------------------------------------------------------------
+
+
+class _FakeCommandEvent:
+    """只够 /sb 用的最小事件替身。"""
+
+    def __init__(self, text: str, umo: str = "aiocqhttp:GroupMessage:1"):
+        self.message_str = text
+        self.unified_msg_origin = umo
+
+    def plain_result(self, text: str) -> str:
+        return text
+
+
+async def _run_sb(plugin, text: str) -> str:
+    ev = _FakeCommandEvent(text)
+    out = ""
+    async for r in plugin.sb_command(ev):
+        out += r
+    return out
+
+
+async def test_sb_default_is_status(plugin):
+    await plugin.initialize()
+    try:
+        assert "Super Bot 状态" in await _run_sb(plugin, "/sb")
+        assert "Super Bot 状态" in await _run_sb(plugin, "/sb status")
+    finally:
+        await plugin.terminate()
+
+
+async def test_sb_help_is_not_status(plugin):
+    """这俩必须不一样——线上旧版就是因为没解析参数才一模一样。"""
+    await plugin.initialize()
+    try:
+        help_text = await _run_sb(plugin, "/sb help")
+        status_text = await _run_sb(plugin, "/sb")
+        assert "/sb do" in help_text
+        assert "Super Bot 状态" not in help_text
+        assert help_text != status_text
+    finally:
+        await plugin.terminate()
+
+
+async def test_sb_unknown_subcommand_shows_help(plugin):
+    await plugin.initialize()
+    try:
+        text = await _run_sb(plugin, "/sb 乱写")
+        assert "没有这个子命令" in text
+        assert "/sb do" in text
+    finally:
+        await plugin.terminate()
+
+
+async def test_sb_do_without_task_shows_usage(plugin):
+    await plugin.initialize()
+    try:
+        assert "用法" in await _run_sb(plugin, "/sb do")
+    finally:
+        await plugin.terminate()
+
+
+async def test_dispatch_outbox_mode_speaks(plugin):
+    sent: list[str] = []
+
+    async def fake_send(umo: str, text: str) -> bool:
+        sent.append(text)
+        return True
+
+    await plugin.initialize()
+    try:
+        plugin._outbox.send = fake_send  # type: ignore[union-attr]
+        tid = await plugin._dispatch_task(
+            "6*7", umo="aiocqhttp:GroupMessage:1", thread="T", deliver="outbox"
+        )
+        assert tid is not None
+        done = await plugin._workers.wait(plugin._assignment_ids[tid], timeout=10)
+        assert done is not None
+        assert sent, "outbox 模式应该自己发消息"
+        assert plugin._store is not None
+        assert await plugin._store.ticket_state(tid) == "done"
+    finally:
+        await plugin.terminate()
+
+
+async def test_dispatch_tool_mode_stays_silent(plugin):
+    """deliver=tool：结果交给模型，插件不许抢话（否则用户收两条）。"""
+    sent: list[str] = []
+
+    async def fake_send(umo: str, text: str) -> bool:
+        sent.append(text)
+        return True
+
+    await plugin.initialize()
+    try:
+        plugin._outbox.send = fake_send  # type: ignore[union-attr]
+        tid = await plugin._dispatch_task(
+            "6*7", umo="aiocqhttp:GroupMessage:1", thread="T", deliver="tool"
+        )
+        assert tid is not None
+        done = await plugin._workers.wait(plugin._assignment_ids[tid], timeout=10)
+        assert done is not None and done.text
+        assert sent == [], f"tool 模式不该自己发消息，实际 {sent}"
+        assert plugin._store is not None
+        assert await plugin._store.ticket_state(tid) == "done"
+    finally:
+        await plugin.terminate()
