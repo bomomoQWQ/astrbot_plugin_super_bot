@@ -207,7 +207,7 @@ Dashboard 表单里用的是**中文短名**，配置文件里用的是英文键
 **《Super-agent 设计探索》** —— 本项目的设计出发点。准入、路由、编队、投递这条链路
 的取舍基本来自那篇文章，`docs/设计/30-decisions.md` 里逐条记了哪些照做、哪些改了主意。
 
-**《为人民服务》**（作者自己的上一个项目）—— `superbot/watchdog.py` 连同
+**《为人民服务》**（我的一个弃坑的项目）—— `superbot/watchdog.py` 连同
 `STALL_THRESHOLD_SEC`、`MAX_RETRIES`、`RETRY_BACKOFF_SEC`、`MAX_ESCALATION`、
 `WATCHDOG_TICK_SEC` 这五个阈值都源自它。从 TypeScript 重写成了 Python，语义保持一致
 （唯一的主动偏离见 `docs/设计/30-decisions.md`）。
