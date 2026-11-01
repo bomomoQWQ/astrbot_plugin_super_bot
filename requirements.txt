@@ -1,0 +1,3 @@
+# Super Bot 的第三方依赖。
+# AstrBot 运行时已自带 aiosqlite，这里显式声明以免宿主环境变动。
+aiosqlite>=0.22

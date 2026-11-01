@@ -1,0 +1,8 @@
+name: astrbot_plugin_super_bot
+display_name: Super Bot
+short_desc: 单一对话人格 + 多任务编队 + 经验沉淀
+description: 基于 AstrBot 的 Super-agent 插件：确定性准入（Gate）、Thread 订阅直通、Router/Worker 编队、Watchdog 与经验沉淀。设计见 docs/。
+author: bomomoQWQ
+version: 0.1.0
+repo: https://github.com/bomomoQWQ/astrbot_plugin_super_bot
+astrbot_version: ">=4.28,<5"
