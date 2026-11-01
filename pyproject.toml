@@ -1,4 +1,10 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q"
+addopts = "-q -m 'not live'"
+markers = [
+    "live: 需要外部服务（真 Bay 沙箱 / 真模型）才跑的用例，默认跳过",
+]
+
+[tool.coverage.run]
+source = ["superbot"]

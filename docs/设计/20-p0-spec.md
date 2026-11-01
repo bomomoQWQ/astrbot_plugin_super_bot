@@ -319,6 +319,20 @@ P0 三块已落地并通过单测（commit `7418ea8`）。
 
 ### 7.2 仍未做
 
-- `P5`：把桩评估器换成真模型（`Context.tool_loop_agent`）、Worker 接沙箱
+- ~~`P5`：把桩评估器换成真模型~~ **已完成**（`SUPERBOT_EVAL_MODE=live` 走 `Context.tool_loop_agent`）
+- ~~Worker 接沙箱~~ **已完成**（`superbot/sandbox.py` + Bay，见 [沙箱与真模型.md](../沙箱与真模型.md)）
 - `P4`：Thread 订阅直通（事件绕过 Router 直达 Worker）
-- 取消链路在真实例里的验证（单测已覆盖 `task.cancel` 语义）
+- 取消链路在真实例里的验证（单测已覆盖 `task.cancel` 语义，`/stop` 那条路还没接）
+- `keepalive_loop` 尚未挂进插件（沙箱目前靠 `finally: destroy` 收尾；长任务要续 TTL 才需要它）
+
+### 7.3 当前可跑的全部验证
+
+| 命令 | 覆盖 | 结果 |
+|---|---|---|
+| `python -m pytest` | 140 条单测（gate/thread_key/store/outbox/router/watchdog/worker/sandbox） | 全绿 |
+| `python -m pytest -m live` | 2 条真打 Bay 的用例（含两沙箱隔离） | 全绿 |
+| `python -m tests.e2e.smoke` | 原生链路（指令/@/不回环/不进模型） | 8/8 |
+| `python -m tests.e2e.scenarios` | Gate→Router→Worker→Outbox 全链路，batch=3 | 12/12 |
+| `python -m tests.e2e.sandbox_smoke` | Bay API 全能力（创建/执行/读写/销毁） | 8/8 |
+| `python -m tests.e2e.live_model` | 真模型回复 | 6/6 |
+| `python -m tests.e2e.live_chain` | **真模型 + 真沙箱** | 9/9 |

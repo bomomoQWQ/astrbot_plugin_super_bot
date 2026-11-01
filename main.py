@@ -55,7 +55,9 @@ from superbot.gate import (  # noqa: E402
 )
 from superbot.outbox import Outbox  # noqa: E402
 from superbot.router import Reply, Router, Trigger  # noqa: E402
+from superbot.sandbox import BaySandbox, SandboxPort  # noqa: E402
 from superbot.store import DispositionRow, Store  # noqa: E402
+from superbot.synthetic import make_synthetic_event  # noqa: E402
 from superbot.thread_key import thread_key, ticket_id_from_eval, trigger_id  # noqa: E402
 from superbot.worker import Assignment, Ticket, WorkerPool, WorkerResult  # noqa: E402
 
@@ -64,7 +66,18 @@ PLUGIN_VERSION = "0.1.0"
 LOG_TAG = "[super-bot]"
 
 EVAL_MODE_ENV = "SUPERBOT_EVAL_MODE"
-"""``ignore``（默认，永不回复）或 ``echo``（对以 ``sb:`` 开头的批次回一句）。"""
+"""``ignore`` / ``echo`` / ``live``。
+
+- ``ignore``：永不回复（只验证批处理）
+- ``echo``：对以 ``sb:`` 开头的批次回一句确定性文本
+- ``live``：用**真模型**做评估（走 ``Context.tool_loop_agent``）
+"""
+
+SANDBOX_ENV = "SUPERBOT_SANDBOX"
+"""设为 ``1`` 时 Worker 在真沙箱里执行（Shipyard Neo / Bay）。"""
+
+BAY_ENDPOINT_ENV = "BAY_ENDPOINT"
+BAY_KEY_ENV = "BAY_API_KEY"
 
 EVAL_DELAY_ENV = "SUPERBOT_EVAL_DELAY"
 """桩评估器的假延迟（秒）。真实模型本来就有 1~3 秒延迟，批处理窗口就是它。"""
@@ -186,6 +199,8 @@ class SuperBotPlugin(star.Star):
         self._router: Router | None = None
         self._outbox: Outbox | None = None
         self._workers: WorkerPool | None = None
+        self._sandbox: SandboxPort | None = None
+        self._sandbox_ids: set[str] = set()
         self._stop: asyncio.Event | None = None
         self._router_task: asyncio.Task | None = None
         self._ticket_ctx: dict[str, dict[str, Any]] = {}
@@ -212,6 +227,19 @@ class SuperBotPlugin(star.Star):
 
         # Worker 池：隔离执行、并发上限、可取消
         self._workers = WorkerPool(run=self._run_worker, on_done=self._on_worker_done)
+
+        # 沙箱（可选）：一个 Ticket 一个 sandbox，自己直连 Bay
+        if _sandbox_enabled():
+            endpoint = os.environ.get(BAY_ENDPOINT_ENV) or "http://localhost:8114"
+            key = _bay_key()
+            if key:
+                self._sandbox = BaySandbox(endpoint=endpoint, api_key=key, ttl=3600)
+                logger.info("%s sandbox enabled: %s", LOG_TAG, endpoint)
+            else:
+                logger.warning(
+                    "%s SUPERBOT_SANDBOX=1 但找不到 BAY_API_KEY，Worker 退回桩执行",
+                    LOG_TAG,
+                )
 
         # 批处理调度：单槽 + 只追加，不用定时器
         self._router = Router(evaluate=self._evaluate)
@@ -378,6 +406,9 @@ class SuperBotPlugin(star.Star):
             [t.text[:16] for t in batch[:4]],
         )
 
+        if _eval_mode() == "live":
+            return await self._evaluate_live(batch)
+
         if _eval_mode() != "echo":
             return []
         if not any(t.text.lstrip().startswith(STUB_NEEDLE) for t in batch):
@@ -405,11 +436,110 @@ class SuperBotPlugin(star.Star):
             )
         return []
 
+    async def _evaluate_live(self, batch: list[Trigger]) -> list[Reply]:
+        """真模型评估器：用 ``Context.tool_loop_agent`` 判断该怎么回。
+
+        刻意**不给工具**（``max_steps=1``）：Router 只判断与分派，不自己执行
+        （ADR-02）。真正的执行交给 Worker。
+
+        没有真实消息时用合成事件当身份载体（``superbot/synthetic.py``）——
+        它自带 UMO、``is_wake=True``，也能被 ``ActiveEventRegistry`` 登记。
+        """
+        if not batch:
+            return []
+        umo = batch[-1].umo
+        thread = batch[-1].thread_key
+        digest = "\n".join(f"- {t.actor_id}: {t.text}" for t in batch[:10])
+
+        try:
+            event = make_synthetic_event(self.context, umo, digest)
+            provider_id = await self.context.get_current_chat_provider_id(umo)
+            resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=(
+                    "下面是一个群/会话里最近的几条消息：\n"
+                    f"{digest}\n\n"
+                    "请用一句简短的中文回应其中真正需要回应的内容；"
+                    "如果都不需要回应，只输出 SKIP。"
+                ),
+                system_prompt="你是简洁的群助手，只输出一句话，不要客套，不要解释。",
+                max_steps=1,
+                tool_call_timeout=60,
+            )
+            plan = (getattr(resp, "completion_text", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s live eval failed: %s", LOG_TAG, exc)
+            return []
+
+        logger.info("%s live eval -> %r", LOG_TAG, plan[:80])
+        if not plan or plan.upper().startswith("SKIP"):
+            return []
+
+        ticket_id = ticket_id_from_eval(f"{thread}:{batch[0].id}")
+        self._ticket_ctx[ticket_id] = {
+            "umo": umo,
+            "thread_key": thread,
+            "batch": len(batch),
+            "plan": plan,
+        }
+        if self._workers is not None:
+            await self._workers.submit(
+                Ticket(
+                    id=ticket_id,
+                    thread_key=thread,
+                    mandate=f"live batch={len(batch)}",
+                    created_at=time.time(),
+                )
+            )
+            logger.info(
+                "%s ticket %s dispatched (live, batch=%d)",
+                LOG_TAG,
+                ticket_id[:8],
+                len(batch),
+            )
+        return []
+
     async def _run_worker(self, ticket: Ticket) -> WorkerResult:
-        """P3 桩 Worker：模拟一次耗时执行。P5 换成真工具循环。"""
+        """Worker：有沙箱就在沙箱里执行，否则走桩。
+
+        沙箱路径刻意演示了必须自己做的两件事：**创建**与**销毁**
+        （``finally`` 里 destroy —— 取消时也一样，否则容器继续占配额）。
+        """
         ctx = self._ticket_ctx.get(ticket.id) or {}
-        await asyncio.sleep(min(0.3, _eval_delay()))
-        return WorkerResult(text=f"ECHO-BATCH:{ctx.get('batch', 0)}", ok=True)
+
+        if self._sandbox is None:
+            await asyncio.sleep(min(0.3, _eval_delay()))
+            if ctx.get("plan"):
+                return WorkerResult(text=ctx["plan"], ok=True)
+            return WorkerResult(text=f"ECHO-BATCH:{ctx.get('batch', 0)}", ok=True)
+
+        sandbox_id: str | None = None
+        try:
+            sandbox_id = await self._sandbox.create(ticket_id=ticket.id)
+            self._sandbox_ids.add(sandbox_id)
+            logger.info("%s sandbox %s created for ticket %s", LOG_TAG, sandbox_id, ticket.id[:8])
+
+            res = await self._sandbox.exec_python(sandbox_id, "print(6*7)")
+            out = (res.output or "").strip()
+            if not res.ok:
+                return WorkerResult(text=f"沙箱执行失败: {res.error}", ok=False)
+
+            await self._sandbox.write_file(sandbox_id, "ticket.txt", ticket.id)
+            plan = ctx.get("plan") or ""
+            text = f"{plan}（沙箱 6×7={out}）" if plan else f"SANDBOX-OK:{out}"
+            return WorkerResult(text=text, ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s sandbox worker failed: %s", LOG_TAG, exc)
+            return WorkerResult(text=f"沙箱失败: {exc}", ok=False)
+        finally:
+            if sandbox_id is not None:
+                self._sandbox_ids.discard(sandbox_id)
+                try:
+                    await self._sandbox.destroy(sandbox_id)
+                    logger.info("%s sandbox %s destroyed", LOG_TAG, sandbox_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("%s sandbox destroy failed: %s", LOG_TAG, exc)
 
     async def _on_worker_done(self, assignment: Assignment) -> None:
         """Worker 结束 → 结果交给 Outbox（不直接对用户信道说话）。"""
@@ -499,3 +629,21 @@ def _eval_delay() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return 0.6
+
+
+def _sandbox_enabled() -> bool:
+    return (os.environ.get(SANDBOX_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bay_key() -> str | None:
+    """Bay 的 API key：环境变量优先，其次 ``.runtime/bay_key.txt``。
+
+    ⚠ 读文件时用 ``utf-8-sig`` —— PowerShell 5.1 的 ``Set-Content -Encoding utf8``
+    会写 BOM，带着 BOM 的 key 会被 Bay 判为 401（我们踩过）。
+    """
+    if k := os.environ.get(BAY_KEY_ENV):
+        return k.strip()
+    p = _HERE / ".runtime" / "bay_key.txt"
+    if p.exists():
+        return p.read_text(encoding="utf-8-sig").strip()
+    return None

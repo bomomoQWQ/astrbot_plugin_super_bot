@@ -125,6 +125,65 @@ def write_config(cfg: dict[str, Any]) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# 真实模型（复用本机已有的凭据）
+# ---------------------------------------------------------------------------
+
+DSH_CREDENTIALS = Path.home() / ".dsh" / ".credentials.yaml"
+
+
+def _read_dsh_secret(name: str) -> str | None:
+    """从 DSH 的凭据文件里取一个密钥（不打印、不落盘）。"""
+    if not DSH_CREDENTIALS.exists():
+        return None
+    import re
+
+    text = DSH_CREDENTIALS.read_text(encoding="utf-8")
+    m = re.search(rf"{re.escape(name)}\s*:\s*(\S+)", text)
+    return m.group(1) if m else None
+
+
+def deepseek_provider(model: str = "deepseek-flash") -> dict[str, Any] | None:
+    """构造一个指向 DeepSeek 官方 API 的 provider 条目。
+
+    凭据复用 ``~/.dsh/.credentials.yaml`` 里的 ``DEEPSEEK_API_KEY``
+    ——也就是当前 DSH 会话所用的那把钥匙，只是换成官方端点。
+
+    Returns:
+        provider 字典；拿不到 key 时返回 ``None``。
+    """
+    key = _read_dsh_secret("DEEPSEEK_API_KEY")
+    if not key:
+        return None
+    return {
+        "id": "deepseek-live",
+        "provider": "openai",
+        "type": "openai_chat_completion",
+        "provider_type": "chat_completion",
+        "enable": True,
+        "key": [key],
+        "api_base": "https://api.deepseek.com/v1",
+        "timeout": 120,
+        "proxy": "",
+        "custom_headers": {},
+        "model": model,
+    }
+
+
+def config_with_real_model(
+    *,
+    model: str = "deepseek-flash",
+    onebot_port: int = ONEBOT_PORT,
+) -> dict[str, Any]:
+    """用真实模型替换假模型的配置。"""
+    cfg = build_config(onebot_port=onebot_port, llm_port=FAKE_LLM_PORT)
+    provider = deepseek_provider(model)
+    if provider is None:
+        raise RuntimeError("拿不到 DEEPSEEK_API_KEY，无法跑真实模型用例")
+    cfg["provider"] = [provider]
+    return cfg
+
+
+# ---------------------------------------------------------------------------
 # 插件接入
 # ---------------------------------------------------------------------------
 
