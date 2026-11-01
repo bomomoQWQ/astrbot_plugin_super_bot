@@ -1,8 +1,28 @@
 name: astrbot_plugin_super_bot
 display_name: Super Bot
-short_desc: 单一对话人格 + 多任务编队 + 经验沉淀
-description: 基于 AstrBot 的 Super-agent 插件：确定性准入（Gate）、Thread 订阅直通、Router/Worker 编队、Watchdog 与经验沉淀。设计见 docs/。
-author: bomomoQWQ
+short_desc: 单一对话人格 + 多任务编队 + 确定性准入
+desc: |
+  把 AstrBot 从"每条消息各回各的"改造成一个**有调度感的助手**：
+
+  - **确定性准入（Gate）**：自消息、指令、白名单、限流四层规则，纯程序判定，不烧模型
+  - **Router 批处理**：同一话题的连续消息合并成一批再评估，避免刷屏；单槽 + 只追加，不用定时器
+  - **Worker 隔离执行**：每个任务一张工单，在 Shipyard Neo 沙箱里跑，可并发、可取消
+  - **可靠投递（Outbox）**：同一会话串行发送、失败退避重试、幂等入队
+  - **Watchdog**：任务停滞检测、退避重试、逐级升级，不靠"看起来在跑"
+  - **Thread 指纹**：同一话题的上下文自动归拢（显式标记 > 引用 > 话题 > 按天）
+
+  默认全部安全关闭（`SUPERBOT_EVAL_MODE=ignore`），装上不会打扰任何现有会话。
+  需要真模型/真沙箱时再按文档开开关。
+
+  设计文档与源码级调研见仓库 `docs/`，每条结论都带 `file:line` 证据。
 version: 0.1.0
+author: bomomoQWQ
 repo: https://github.com/bomomoQWQ/astrbot_plugin_super_bot
 astrbot_version: ">=4.28,<5"
+support_platforms:
+  - aiocqhttp
+tags:
+  - agent
+  - 调度
+  - 多任务
+  - 沙箱

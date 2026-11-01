@@ -37,35 +37,79 @@ from typing import Any
 # 让 ``from superbot import ...`` 在本文件被以任意方式加载时都能工作
 # （插件模块名是 data.plugins.<name>.main，相对导入在某些加载路径下不可靠）。
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
 
 from astrbot.api import logger, star  # noqa: E402
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter  # noqa: E402
 from astrbot.api.event.filter import EventMessageType  # noqa: E402
 
-from superbot import limits  # noqa: E402
-from superbot.gate import (  # noqa: E402
-    EventView,
-    GateConfig,
-    GateDecision,
-    RateLimiter,
-    Verdict,
-    decide,
-)
-from superbot.outbox import Outbox  # noqa: E402
-from superbot.router import Reply, Router, Trigger  # noqa: E402
-from superbot.sandbox import BaySandbox, SandboxPort, keepalive_loop  # noqa: E402
-from superbot.store import DispositionRow, Store  # noqa: E402
-from superbot.synthetic import make_synthetic_event  # noqa: E402
-from superbot.thread_key import thread_key, ticket_id_from_eval, trigger_id  # noqa: E402
-from superbot.worker import (  # noqa: E402
-    Assignment,
-    Outcome,
-    Ticket,
-    WorkerPool,
-    WorkerResult,
-)
+# 包内加载（框架走这条，模块名是 data.plugins.<目录>.main）用相对导入；
+# 直接跑 main.py 或用文件路径 import（测试）时没有包上下文，回退到顶层导入。
+# 用 ``__package__`` 判断而不是 try/except：避免相对导入里的真实错误被当成
+# "没有包上下文" 吞掉。
+if __package__:
+    from .superbot import limits  # noqa: F401
+    from .superbot.gate import (  # noqa: F401
+        EventView,
+        GateConfig,
+        GateDecision,
+        RateLimiter,
+        Verdict,
+        decide,
+    )
+    from .superbot.outbox import Outbox  # noqa: F401
+    from .superbot.router import Reply, Router, Trigger  # noqa: F401
+    from .superbot.sandbox import (  # noqa: F401
+        BaySandbox,
+        SandboxPort,
+        keepalive_loop,
+    )
+    from .superbot.store import DispositionRow, Store  # noqa: F401
+    from .superbot.synthetic import make_synthetic_event  # noqa: F401
+    from .superbot.thread_key import (  # noqa: F401
+        thread_key,
+        ticket_id_from_eval,
+        trigger_id,
+    )
+    from .superbot.worker import (  # noqa: F401
+        Assignment,
+        Outcome,
+        Ticket,
+        WorkerPool,
+        WorkerResult,
+    )
+else:
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+    from superbot import limits  # noqa: F401
+    from superbot.gate import (  # noqa: F401
+        EventView,
+        GateConfig,
+        GateDecision,
+        RateLimiter,
+        Verdict,
+        decide,
+    )
+    from superbot.outbox import Outbox  # noqa: F401
+    from superbot.router import Reply, Router, Trigger  # noqa: F401
+    from superbot.sandbox import (  # noqa: F401
+        BaySandbox,
+        SandboxPort,
+        keepalive_loop,
+    )
+    from superbot.store import DispositionRow, Store  # noqa: F401
+    from superbot.synthetic import make_synthetic_event  # noqa: F401
+    from superbot.thread_key import (  # noqa: F401
+        thread_key,
+        ticket_id_from_eval,
+        trigger_id,
+    )
+    from superbot.worker import (  # noqa: F401
+        Assignment,
+        Outcome,
+        Ticket,
+        WorkerPool,
+        WorkerResult,
+    )
 
 # 让框架自带的 /stop 能停到我们：把每个会话的活跃任务登记进 ActiveEventRegistry。
 # 这个模块是 AstrBot 内置命令用的同一个（builtin_stars/builtin_commands/commands/
@@ -291,6 +335,9 @@ class SuperBotPlugin(star.Star):
         self._start_keepalive()
 
         self._started_at = time.time()
+        logger.info(
+            "%s loaded as %s (package=%r)", LOG_TAG, __name__, __package__
+        )
         logger.info(
             "%s initialized: db=%s schema=v%s self_id=%s eval_mode=%s",
             LOG_TAG,

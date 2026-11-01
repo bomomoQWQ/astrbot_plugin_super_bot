@@ -1,3 +1,5 @@
 # Super Bot 的第三方依赖。
-# AstrBot 运行时已自带 aiosqlite，这里显式声明以免宿主环境变动。
+# AstrBot 安装插件时会照着这个文件自动装（star_manager.py:1112-1159），
+# 所以运行期真正 import 的都要写上，不能指望宿主已经装了。
 aiosqlite>=0.22
+httpx>=0.27
