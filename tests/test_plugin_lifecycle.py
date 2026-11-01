@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -367,3 +368,160 @@ def test_gate_conf_reads_gate_section(plugin, plugin_mod):
     assert conf.rate_limit == 7
     assert conf.rate_window_sec == 12.5
     plugin_mod.configure({})
+
+
+# ---------------------------------------------------------------------------
+# Watchdog 接线 / 落盘 / 状态命令
+# ---------------------------------------------------------------------------
+
+
+async def test_watchdog_and_housekeeping_started(plugin):
+    await plugin.initialize()
+    try:
+        assert plugin._watchdog is not None
+        assert plugin._watchdog_task is not None
+        assert plugin._watchdog_task.get_name() == "superbot-watchdog"
+        assert not plugin._watchdog_task.done()
+        assert plugin._housekeeping_task is not None
+        assert not plugin._housekeeping_task.done()
+    finally:
+        await plugin.terminate()
+    assert plugin._watchdog is None
+    assert plugin._watchdog_task is None
+    assert plugin._housekeeping_task is None
+    assert _superbot_tasks() == []
+
+
+async def test_open_ticket_records_and_watches(plugin):
+    """开工单要落库、记 accepted、并且被 watchdog 盯上。"""
+    await plugin.initialize()
+    try:
+        await plugin._open_ticket("tk-1", "T", "live batch=1")
+        assert plugin._watchdog is not None
+        assert plugin._watchdog.active() == 1
+
+        assert plugin._store is not None
+        assert (await plugin._store.counts())["ticket"] == 1
+        # 只有 accepted，还没有终态 → 算"没跑完"
+        assert await plugin._store.open_tickets() == ["tk-1"]
+        assert await plugin._store.ticket_state("tk-1") == "running"
+    finally:
+        await plugin.terminate()
+
+
+async def test_delivered_fact_closes_ticket(plugin, plugin_mod):
+    await plugin.initialize()
+    try:
+        await plugin._open_ticket("tk-1", "T", "m")
+        await plugin._fact("tk-1", "delivered", "ok")
+        assert plugin._store is not None
+        assert await plugin._store.open_tickets() == []
+        assert await plugin._store.ticket_state("tk-1") == "done"
+    finally:
+        await plugin.terminate()
+
+
+async def test_reconcile_marks_interrupted_as_blocked(plugin):
+    """重启对账：上一轮没跑完的工单如实记 blocked(restart)。"""
+    await plugin.initialize()
+    try:
+        assert plugin._store is not None
+        # 模拟"上一轮留下的"未完成工单
+        from superbot.store import TicketRow
+
+        await plugin._store.create_ticket(
+            TicketRow(id="old", thread_key="T", mandate_json="m", created_at=0.0)
+        )
+        await plugin._store.add_fact("old", "accepted")
+
+        await plugin._reconcile_after_restart()
+
+        assert await plugin._store.open_tickets() == []
+        assert await plugin._store.ticket_state("old") == "blocked"
+    finally:
+        await plugin.terminate()
+
+
+async def test_watchdog_retry_resubmits_ticket(plugin, plugin_mod):
+    """watchdog 判重试时要真的把工单重新提交一次。"""
+    await plugin.initialize()
+    try:
+        workers = plugin._workers
+        assert workers is not None
+
+        async def hang(_ticket):
+            await asyncio.sleep(30)
+
+        workers.run = hang
+        plugin._ticket_ctx["tk-1"] = {"umo": "aiocqhttp:GroupMessage:1", "thread_key": "T"}
+        await plugin._open_ticket("tk-1", "T", "m")
+        old_id = await workers.submit(
+            plugin_mod.Ticket(id="tk-1", thread_key="T", mandate="m", created_at=0.0)
+        )
+        plugin._assignment_ids["tk-1"] = old_id
+        await asyncio.sleep(0.05)
+
+        await plugin._on_watchdog_action(
+            plugin_mod.Action(kind=plugin_mod.ActionKind.RETRY, ticket_id="tk-1", attempt=1)
+        )
+
+        new_id = plugin._assignment_ids["tk-1"]
+        assert new_id != old_id, "应该提交了一次新的执行"
+        assert workers.get(old_id) is not None
+        assert workers.get(old_id).outcome is plugin_mod.Outcome.CANCELLED
+    finally:
+        await plugin.terminate()
+
+
+async def test_watchdog_failed_blocks_and_notifies(plugin, plugin_mod):
+    sent: list[str] = []
+
+    async def fake_send(umo: str, text: str) -> bool:
+        sent.append(text)
+        return True
+
+    await plugin.initialize()
+    try:
+        plugin._outbox.send = fake_send  # type: ignore[union-attr]
+        plugin._ticket_ctx["tk-1"] = {"umo": "aiocqhttp:GroupMessage:1", "thread_key": "T"}
+        await plugin._open_ticket("tk-1", "T", "m")
+
+        await plugin._on_watchdog_action(
+            plugin_mod.Action(kind=plugin_mod.ActionKind.FAILED, ticket_id="tk-1")
+        )
+
+        assert plugin._watchdog is not None
+        assert plugin._watchdog.active() == 0
+        assert plugin._store is not None
+        assert await plugin._store.ticket_state("tk-1") == "blocked"
+        assert plugin._ticket_ctx.get("tk-1") is None, "失败后要清掉上下文"
+        assert any("放弃" in t for t in sent), f"应该通知用户，实际 {sent}"
+    finally:
+        await plugin.terminate()
+
+
+async def test_status_text_has_sections(plugin):
+    await plugin.initialize()
+    try:
+        text = await plugin._status_text()
+        for word in ("Super Bot 状态", "Router", "Worker", "Watchdog", "库"):
+            assert word in text, f"状态里缺 {word}：\n{text}"
+    finally:
+        await plugin.terminate()
+
+
+async def test_prune_once_cleans_old_rows(plugin, plugin_mod):
+    await plugin.initialize()
+    try:
+        assert plugin._store is not None
+        old = time.time() - 400 * 86400
+        await plugin._store.record_disposition(
+            plugin_mod.DispositionRow(
+                trigger_id=None, verdict="route", reason="old", ts=old
+            )
+        )
+        assert (await plugin._store.counts())["disposition"] == 1
+        await plugin._prune_once()
+        assert (await plugin._store.counts())["disposition"] == 0
+    finally:
+        await plugin.terminate()

@@ -77,6 +77,15 @@ async def run() -> int:
         action = await bot.wait_for_action("send_group_msg", timeout=20)
         check(action is not None, "/help 有回复", env.log_tail(20))
 
+        # --- 2.5 /sb：插件自己的状态命令 ------------------------------------
+        bot.reset()
+        await bot.send_group("/sb", user_id=20002)
+        status = await bot.wait_for_text("Super Bot 状态", timeout=20)
+        check(status is not None, "/sb 能报状态", env.log_tail(20))
+        if status:
+            for word in ("Router", "Worker", "Watchdog"):
+                check(word in status, f"状态里有 {word}", status)
+
         # --- 3. @机器人：唤醒主 agent，模型被调用 ---------------------------
         bot.reset()
         llm.reset()

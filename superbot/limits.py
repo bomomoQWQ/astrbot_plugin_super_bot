@@ -87,3 +87,10 @@ TRIGGER_RETENTION_DAYS = 14
 
 DISPOSITION_RETENTION_DAYS = 30
 """disposition（去向审计）的保留天数。"""
+
+HOUSEKEEPING_INTERVAL_SEC = 6 * 3600.0
+"""定期清理（prune）的间隔，默认 6 小时。disposition 每条消息写一行，
+不清理的话跑一年就是个没人管的垃圾堆。"""
+
+TICKET_RETENTION_DAYS = 90
+"""工单（含它的事实）的保留天数。这是审计数据，留久一点但也不能永远留。"""

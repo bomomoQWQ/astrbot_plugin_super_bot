@@ -460,17 +460,72 @@ class Store:
             for r in rows
         ]
 
+    # -- 查询（给 /sb status 与重启对账用） --------------------------------
+
+    async def counts(self) -> dict[str, int]:
+        """各表行数，用于状态展示。"""
+        out: dict[str, int] = {}
+        async with self._db() as db:
+            for table in ("trigger", "thread", "thread_pending", "ticket", "ticket_fact", "disposition"):
+                cur = await db.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                row = await cur.fetchone()
+                out[table] = int(row["n"]) if row else 0
+        return out
+
+    async def open_tickets(self, limit: int = 200) -> list[str]:
+        """取出**没有终态事实**的工单 id。
+
+        终态事实就是 ``ticket_state_from_facts`` 里那三个"越靠前越终局"的 kinds：
+        ``human_stopped`` / ``delivered`` / ``blocked``。剩下的（只有 accepted、
+        或 worker_failed）表示"还没跑完"。
+
+        用途：进程重启后对账 —— 这些工单的任务已经随内存一起没了，
+        如实记一条 ``blocked(restart)``，**不假装能续跑**。
+        """
+        async with self._db() as db:
+            cur = await db.execute(
+                "SELECT t.id AS id FROM ticket t "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM ticket_fact f WHERE f.ticket_id = t.id"
+                "  AND f.kind IN ('human_stopped','delivered','blocked')"
+                ") ORDER BY t.created_at DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+        return [str(r["id"]) for r in rows]
+
     # -- 清理 -------------------------------------------------------------
 
     async def prune(self, now: float | None = None) -> None:
-        """按保留期清理追加型数据，防止无限增长。"""
+        """按保留期清理追加型数据，防止无限增长。
+
+        清四样：
+
+        - ``trigger`` / ``disposition``：按保留期
+        - ``thread_pending``：指向已删除 trigger 的孤儿行
+        - ``ticket`` + 它的 ``ticket_fact``：整张工单按保留期一起清
+          （只删 ticket 不删 fact 会留下永远查不到的孤儿事实）
+        """
         ts = now if now is not None else time.time()
         trigger_before = ts - limits.TRIGGER_RETENTION_DAYS * 86400
         disp_before = ts - limits.DISPOSITION_RETENTION_DAYS * 86400
+        ticket_before = ts - limits.TICKET_RETENTION_DAYS * 86400
         async with self._write_lock:
             async with self._db() as db:
                 await db.execute("DELETE FROM trigger WHERE ts < ?", (trigger_before,))
                 await db.execute(
                     "DELETE FROM disposition WHERE ts < ?", (disp_before,)
+                )
+                await db.execute(
+                    "DELETE FROM thread_pending WHERE trigger_id NOT IN "
+                    "(SELECT id FROM trigger)"
+                )
+                await db.execute(
+                    "DELETE FROM ticket_fact WHERE ticket_id IN "
+                    "(SELECT id FROM ticket WHERE created_at < ?)",
+                    (ticket_before,),
+                )
+                await db.execute(
+                    "DELETE FROM ticket WHERE created_at < ?", (ticket_before,)
                 )
                 await db.commit()

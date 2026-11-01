@@ -63,12 +63,13 @@ if __package__:
         SandboxPort,
         keepalive_loop,
     )
-    from .superbot.store import DispositionRow, Store  # noqa: F401
+    from .superbot.store import DispositionRow, Store, TicketRow, TriggerRow  # noqa: F401
     from .superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
         trigger_id,
     )
+    from .superbot.watchdog import Action, ActionKind, Watchdog  # noqa: F401
     from .superbot.worker import (  # noqa: F401
         Assignment,
         Outcome,
@@ -95,12 +96,13 @@ else:
         SandboxPort,
         keepalive_loop,
     )
-    from superbot.store import DispositionRow, Store  # noqa: F401
+    from superbot.store import DispositionRow, Store, TicketRow, TriggerRow  # noqa: F401
     from superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
         trigger_id,
     )
+    from superbot.watchdog import Action, ActionKind, Watchdog  # noqa: F401
     from superbot.worker import (  # noqa: F401
         Assignment,
         Outcome,
@@ -181,6 +183,18 @@ WORKER_DELAY_ENV = "SUPERBOT_WORKER_DELAY"
 
 AGENT_STEPS_ENV = "SUPERBOT_AGENT_STEPS"
 """Worker 的工具循环最多几步（默认 6）。"""
+
+WATCHDOG_TICK_ENV = "SUPERBOT_WATCHDOG_TICK_SEC"
+"""watchdog 扫描间隔（秒），默认 60。测试会调很小。"""
+
+STALL_ENV = "SUPERBOT_STALL_SEC"
+"""多久没进展判停滞（秒），默认 600。"""
+
+HOUSEKEEPING_ENV = "SUPERBOT_HOUSEKEEPING_SEC"
+"""定期清理间隔（秒），默认 6 小时。"""
+
+RETRY_BACKOFF_ENV = "SUPERBOT_RETRY_BACKOFF_SEC"
+"""重试退避序列（逗号分隔秒），默认 ``30,60,120``。测试会调成零点几秒。"""
 
 SANDBOX_HOLD_ENV = "SUPERBOT_SANDBOX_HOLD_SEC"
 """Worker 在沙箱里**多待**几秒再销毁（默认 0）。
@@ -315,6 +329,9 @@ class SuperBotPlugin(star.Star):
         self._umo_tickets: dict[str, set[str]] = {}
         self._assignment_ids: dict[str, str] = {}
         self._keepalive_task: asyncio.Task | None = None
+        self._watchdog: Watchdog | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._housekeeping_task: asyncio.Task | None = None
         self._stop: asyncio.Event | None = None
         self._router_task: asyncio.Task | None = None
         self._ticket_ctx: dict[str, dict[str, Any]] = {}
@@ -365,6 +382,24 @@ class SuperBotPlugin(star.Star):
         # 沙箱保活：AstrBot 自己从不续 TTL，到期工作区会被级联删除
         self._start_keepalive()
 
+        # 任务级停滞检测：卡住不会自己好，得有东西盯着
+        self._watchdog = Watchdog(
+            stall_seconds=_stall_threshold(),
+            retries=limits.MAX_RETRIES,
+            backoff=_retry_backoff(),
+            max_escalation=limits.MAX_ESCALATION,
+        )
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(), name="superbot-watchdog"
+        )
+        # 定期清理：disposition 每条消息写一行，不清就无限长
+        self._housekeeping_task = asyncio.create_task(
+            self._housekeeping_loop(), name="superbot-housekeeping"
+        )
+
+        # 重启对账：上一轮没跑完的工单，如实记成 blocked，不假装能续跑
+        await self._reconcile_after_restart()
+
         self._started_at = time.time()
         logger.info(
             "%s loaded as %s (package=%r)", LOG_TAG, __name__, __package__
@@ -400,6 +435,17 @@ class SuperBotPlugin(star.Star):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._keepalive_task = None
+
+        for task_attr in ("_watchdog_task", "_housekeeping_task"):
+            task = getattr(self, task_attr)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                setattr(self, task_attr, None)
+        self._watchdog = None
 
         if self._outbox is not None:
             try:
@@ -492,6 +538,280 @@ class SuperBotPlugin(star.Star):
         )
         logger.info("%s keepalive started: every %.0fs", LOG_TAG, interval)
 
+    # -- 任务监控（watchdog）与清理 ----------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """周期性扫描停滞任务并执行动作。
+
+        ``Watchdog.tick()`` 是纯函数式的（给时刻、返回动作），副作用都在这里。
+        """
+        if self._stop is None:
+            return
+        interval = _watchdog_interval()
+        logger.info("%s watchdog started: tick=%.0fs stall=%.0fs",
+                    LOG_TAG, interval, _stall_threshold())
+        while not self._stop.is_set():
+            try:
+                if self._watchdog is not None:
+                    for action in self._watchdog.tick():
+                        await self._on_watchdog_action(action)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s watchdog tick failed: %s", LOG_TAG, exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    async def _on_watchdog_action(self, action: Action) -> None:
+        """把 watchdog 的判定变成实际动作。"""
+        ticket_id = action.ticket_id
+        logger.warning(
+            "%s watchdog %s ticket=%s %s",
+            LOG_TAG,
+            action.kind.value,
+            ticket_id[:8],
+            action.detail,
+        )
+
+        if action.kind is ActionKind.STALLED:
+            # 先只标记，把重试留给下一个 tick（避免一次 tick 连做两件事）
+            await self._fact(ticket_id, "worker_failed", "stalled")
+            return
+
+        if action.kind is ActionKind.RETRY:
+            await self._fact(ticket_id, "worker_failed", action.detail or "stall-retry")
+            await self._retry_ticket(ticket_id, reason=action.detail)
+            return
+
+        if action.kind is ActionKind.ESCALATE:
+            await self._fact(
+                ticket_id, "worker_failed", f"escalate-{action.level}"
+            )
+            await self._emit_user(ticket_id, "这个任务卡住了，我重新安排一次。")
+            await self._retry_ticket(ticket_id, reason=action.detail)
+            return
+
+        # FAILED
+        if self._watchdog is not None:
+            self._watchdog.finish(ticket_id)
+        logger.error(
+            "%s watchdog gave up ticket=%s (stalled-to-death)", LOG_TAG, ticket_id[:8]
+        )
+        await self._fact(ticket_id, "blocked", "stalled-to-death")
+        await self._emit_user(ticket_id, "这次没跑完，我已经放弃了。")
+        self._ticket_ctx.pop(ticket_id, None)
+
+    async def _retry_ticket(self, ticket_id: str, *, reason: str = "") -> bool:
+        """重跑一张工单：先取消卡住的那次，再重新提交。"""
+        ctx = self._ticket_ctx.get(ticket_id)
+        if ctx is None or self._workers is None:
+            return False
+
+        old = self._assignment_ids.get(ticket_id)
+        if old:
+            # 标记 retrying：让 _on_worker_done 知道"这次取消是我们要的"，
+            # 别把 ctx 和停止钩子清掉
+            ctx["retrying"] = True
+            try:
+                await self._workers.cancel(old)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 注意：这里**不调 touch**。重试不是进展——touch 会把停滞计时和
+        # 重试预算一起清零，那样 watchdog 自己一动手就永远追不到"真的卡住"，
+        # 会变成无限重试。这条踩过，e2e 里能复现。
+        new_assignment = await self._workers.submit(
+            Ticket(
+                id=ticket_id,
+                thread_key=ctx.get("thread_key", ""),
+                mandate=f"retry: {reason}"[:200],
+                created_at=time.time(),
+            )
+        )
+        self._assignment_ids[ticket_id] = new_assignment
+        logger.info(
+            "%s retried ticket %s (new assignment %s) reason=%s",
+            LOG_TAG,
+            ticket_id[:8],
+            new_assignment[:8],
+            reason,
+        )
+        return True
+
+    async def _housekeeping_loop(self) -> None:
+        """定期清理追加型数据。"""
+        if self._stop is None:
+            return
+        interval = _housekeeping_interval()
+        while not self._stop.is_set():
+            await self._prune_once()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                return
+            except asyncio.TimeoutError:
+                continue
+
+    async def _prune_once(self) -> None:
+        if self._store is None:
+            return
+        try:
+            await self._store.prune()
+            counts = await self._store.counts()
+            logger.info(
+                "%s prune done: trigger=%d ticket=%d disposition=%d",
+                LOG_TAG,
+                counts.get("trigger", 0),
+                counts.get("ticket", 0),
+                counts.get("disposition", 0),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s prune failed: %s", LOG_TAG, exc)
+
+    async def _reconcile_after_restart(self) -> None:
+        """上一轮没跑完的工单：如实记 blocked，不假装能续跑。
+
+        诚实比好看重要：那些任务的工作随内存一起没了，假装"还在跑"只会让
+        用户等一个永远不来的回复。
+        """
+        if self._store is None:
+            return
+        try:
+            open_ids = await self._store.open_tickets()
+            for tid in open_ids:
+                await self._store.add_fact(tid, "blocked", "restart")
+            if open_ids:
+                logger.warning(
+                    "%s reconciled %d interrupted ticket(s) as blocked(restart)",
+                    LOG_TAG,
+                    len(open_ids),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s reconcile failed: %s", LOG_TAG, exc)
+
+    # -- 状态命令 -----------------------------------------------------------
+
+    @filter.command("sb")
+    async def sb_command(self, event: AstrMessageEvent):
+        """``/sb status`` —— 看一眼系统现在在干嘛。"""
+        yield event.plain_result(await self._status_text())
+
+    async def _status_text(self) -> str:
+        lines = ["Super Bot 状态"]
+        lines.append(f"　评估：{_eval_mode()}（来源 {_eval_mode_source()}）")
+        lines.append(f"　沙箱：{'开' if self._sandbox is not None else '关'}")
+
+        if self._router is not None:
+            snap = self._router.snapshot()
+            lines.append(
+                f"　Router：排队 {snap['pending']}，评估中 {snap['evaluating']}，"
+                f"累计 {snap['evals']} 次"
+            )
+        if self._workers is not None:
+            lines.append(f"　Worker：在跑 {self._workers.running()}")
+        if self._watchdog is not None:
+            lines.append(
+                f"　Watchdog：监控 {self._watchdog.active()}，"
+                f"已判死 {len(self._watchdog.failed)}"
+            )
+        if self._store is not None:
+            try:
+                c = await self._store.counts()
+                lines.append(
+                    f"　库：disposition {c['disposition']}，"
+                    f"trigger {c['trigger']}，ticket {c['ticket']}"
+                )
+            except Exception:  # noqa: BLE001
+                lines.append("　库：查询失败")
+        return "\n".join(lines)
+
+    # -- 事实与回话的小工具 -------------------------------------------------
+
+    def _touch(self, ticket_id: str) -> None:
+        """报告一次实质进展，重置该工单的停滞计时。"""
+        if self._watchdog is not None:
+            self._watchdog.touch(ticket_id)
+
+    def _on_tool_call(self, ticket_id: str):
+        """造一个给 toolset 用的回调：打日志 + 报进展。"""
+
+        def _cb(name: str, ok: bool, ms: int) -> None:
+            logger.info("%s tool %s ok=%s %dms", LOG_TAG, name, ok, ms)
+            self._touch(ticket_id)
+
+        return _cb
+
+    async def _fact(self, ticket_id: str, kind: str, payload: str | None = None) -> None:
+        """给工单记一条事实（``delivered`` / ``worker_failed`` / ``blocked`` …）。"""
+        if self._store is None:
+            return
+        try:
+            await self._store.add_fact(ticket_id, kind, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s add_fact(%s) failed: %s", LOG_TAG, kind, exc)
+
+    async def _emit_user(self, ticket_id: str, text: str) -> None:
+        """按工单找到会话，回一句话。"""
+        ctx = self._ticket_ctx.get(ticket_id) or {}
+        umo = ctx.get("umo")
+        if not umo:
+            return
+        await self._emit(
+            [Reply(umo=umo, text=text, thread_key=ctx.get("thread_key", ""))]
+        )
+
+    # -- 落盘 ---------------------------------------------------------------
+
+    async def _persist_trigger(
+        self, view: EventView, thread: str, event: AstrMessageEvent
+    ) -> None:
+        """把这一条消息落盘（幂等：同一个 trigger id 只写一次）。
+
+        为什么要有：内存里的队列一重启就没了，但"谁在什么时候说了什么、
+        为什么被路由"这件事得留得下来，否则出事没法查。
+        """
+        if self._store is None:
+            return
+        try:
+            tid = trigger_id(
+                "aiocqhttp", thread, _message_id(event) or f"{view.sender_id}:{time.time()}"
+            )
+            await self._store.add_trigger(
+                TriggerRow(
+                    id=tid,
+                    source=view.chat_key,
+                    thread_key=thread,
+                    umo=view.umo,
+                    actor_id=view.sender_id,
+                    text=view.message_str[:1000],
+                    ts=time.time(),
+                    raw_ref=_message_id(event) or None,
+                )
+            )
+            await self._store.ensure_thread(thread)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s persist trigger failed: %s", LOG_TAG, exc)
+
+    async def _open_ticket(
+        self, ticket_id: str, thread: str, mandate: str
+    ) -> None:
+        """开一张工单：写 ticket 行 + accepted 事实 + 让 watchdog 盯上它。"""
+        if self._store is not None:
+            try:
+                await self._store.create_ticket(
+                    TicketRow(
+                        id=ticket_id,
+                        thread_key=thread,
+                        mandate_json=mandate[:200],
+                        created_at=time.time(),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("%s create_ticket failed: %s", LOG_TAG, exc)
+            await self._fact(ticket_id, "accepted", mandate[:200])
+        if self._watchdog is not None:
+            self._watchdog.watch(ticket_id)
+
     # -- 主处理器 ----------------------------------------------------------
 
     @filter.event_message_type(EventMessageType.ALL)
@@ -516,6 +836,7 @@ class SuperBotPlugin(star.Star):
         if decision.verdict is Verdict.ROUTE:
             thread = thread_key(view, reply_ref=_reply_ref(event))
             self._enqueue(view, thread, event)
+            await self._persist_trigger(view, thread, event)
 
         await self._record(view, decision, thread)
         logger.info(
@@ -590,6 +911,9 @@ class SuperBotPlugin(star.Star):
         }
 
         if self._workers is not None:
+            await self._open_ticket(
+                ticket_id, thread, f"stub batch={len(batch)}"
+            )
             assignment_id = await self._workers.submit(
                 Ticket(
                     id=ticket_id,
@@ -661,6 +985,7 @@ class SuperBotPlugin(star.Star):
             "task": "\n".join(t.text for t in batch[:10]),
         }
         if self._workers is not None:
+            await self._open_ticket(ticket_id, thread, f"live batch={len(batch)}")
             assignment_id = await self._workers.submit(
                 Ticket(
                     id=ticket_id,
@@ -706,9 +1031,7 @@ class SuperBotPlugin(star.Star):
             tools = build_sandbox_tools(
                 self._sandbox,  # type: ignore[arg-type]
                 sandbox_id,
-                on_call=lambda name, ok, ms: logger.info(
-                    "%s tool %s ok=%s %dms", LOG_TAG, name, ok, ms
-                ),
+                on_call=self._on_tool_call(ticket.id),
             )
 
             task = ctx.get("task") or ctx.get("plan") or ""
@@ -790,17 +1113,27 @@ class SuperBotPlugin(star.Star):
 
     async def _on_worker_done(self, assignment: Assignment) -> None:
         """Worker 结束 → 结果交给 Outbox（不直接对用户信道说话）。"""
-        ctx = self._ticket_ctx.get(assignment.ticket.id) or {}
+        ticket_id = assignment.ticket.id
+        ctx = self._ticket_ctx.get(ticket_id) or {}
         umo = ctx.get("umo")
         logger.info(
             "%s worker done ticket=%s outcome=%s text=%r",
             LOG_TAG,
-            assignment.ticket.id[:8],
+            ticket_id[:8],
             assignment.outcome.value if assignment.outcome else "?",
             assignment.text[:200],
         )
-        self._ticket_ctx.pop(assignment.ticket.id, None)
-        self._unregister_stop_hook(assignment.ticket.id)
+
+        # 重试路径：这次结束是 watchdog 自己取消的，ctx 与停止钩子要留给新的一次
+        if ctx.get("retrying"):
+            ctx.pop("retrying", None)
+            logger.info("%s ticket %s 正在重试，保留上下文", LOG_TAG, ticket_id[:8])
+            return
+
+        if self._watchdog is not None:
+            self._watchdog.finish(ticket_id)
+        self._ticket_ctx.pop(ticket_id, None)
+        self._unregister_stop_hook(ticket_id)
         if not umo:
             return
 
@@ -810,9 +1143,10 @@ class SuperBotPlugin(star.Star):
             logger.error(
                 "%s ticket %s failed: %s",
                 LOG_TAG,
-                assignment.ticket.id[:8],
+                ticket_id[:8],
                 assignment.error or assignment.text,
             )
+            await self._fact(ticket_id, "worker_failed", (assignment.error or "")[:200])
             await self._emit(
                 [
                     Reply(
@@ -823,8 +1157,14 @@ class SuperBotPlugin(star.Star):
                 ]
             )
             return
-        if assignment.outcome is Outcome.CANCELLED or not assignment.text:
+        if assignment.outcome is Outcome.CANCELLED:
+            # 被 /stop 取消 → 记"人工停止"，让状态机落到 stopped
+            await self._fact(ticket_id, "human_stopped", "cancelled")
             return
+        if not assignment.text:
+            return
+
+        await self._fact(ticket_id, "delivered", assignment.text[:200])
         await self._emit(
             [
                 Reply(
@@ -834,6 +1174,7 @@ class SuperBotPlugin(star.Star):
                 )
             ]
         )
+        return
 
     # -- 停止钩子：让框架的 /stop 能停到我们 -------------------------------
 
@@ -915,6 +1256,7 @@ class SuperBotPlugin(star.Star):
                 aid = self._assignment_ids.get(ticket_id)
                 if aid and await self._workers.cancel(aid):
                     cancelled += 1
+                    await self._fact(ticket_id, "human_stopped", "stop-command")
 
         logger.info(
             "%s stop umo=%s cancelled=%d dropped_pending=%d",
@@ -1089,6 +1431,51 @@ def _agent_max_steps() -> int:
         return max(1, min(20, int(raw)))
     except (TypeError, ValueError):
         return 6
+
+
+def _watchdog_interval() -> float:
+    """watchdog 扫描间隔（秒），默认取 ``limits.WATCHDOG_TICK_SEC``（60s）。"""
+    raw = os.environ.get(WATCHDOG_TICK_ENV)
+    if not raw:
+        return limits.WATCHDOG_TICK_SEC
+    try:
+        return max(0.05, float(raw))
+    except ValueError:
+        return limits.WATCHDOG_TICK_SEC
+
+
+def _stall_threshold() -> float:
+    """多久没进展算停滞（秒），默认 600。"""
+    raw = os.environ.get(STALL_ENV)
+    if not raw:
+        return limits.STALL_THRESHOLD_SEC
+    try:
+        return max(0.05, float(raw))
+    except ValueError:
+        return limits.STALL_THRESHOLD_SEC
+
+
+def _retry_backoff() -> tuple[float, ...]:
+    """重试退避序列。默认 ``limits.RETRY_BACKOFF_SEC``。"""
+    raw = os.environ.get(RETRY_BACKOFF_ENV)
+    if not raw:
+        return limits.RETRY_BACKOFF_SEC
+    try:
+        vals = tuple(float(x) for x in raw.split(",") if x.strip())
+        return vals or limits.RETRY_BACKOFF_SEC
+    except ValueError:
+        return limits.RETRY_BACKOFF_SEC
+
+
+def _housekeeping_interval() -> float:
+    """清理间隔（秒），默认 6 小时。"""
+    raw = os.environ.get(HOUSEKEEPING_ENV)
+    if not raw:
+        return limits.HOUSEKEEPING_INTERVAL_SEC
+    try:
+        return max(0.05, float(raw))
+    except ValueError:
+        return limits.HOUSEKEEPING_INTERVAL_SEC
 
 
 def _sandbox_hold() -> float:
