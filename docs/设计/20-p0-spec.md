@@ -301,8 +301,24 @@ P0 三块已落地并通过单测（commit `7418ea8`）。
 
 尚未验证的验收项（需要 AstrBot 在场，即远程服务器）：
 
-- 装进 `data/plugins/` 能加载
-- 日志里能看到每条消息的 `GateDecision.reason`
-- 普通闲聊不触发主 agent、`/stop` 能停
+- ~~装进 `data/plugins/` 能加载~~ **已验**（本地实例加载成功）
+- ~~日志里能看到每条消息的 `GateDecision.reason`~~ **已验**
+- ~~普通闲聊不触发主 agent~~ **已验**
 
-下一步实现顺序：`main.py` 适配层（`EventView` 抽取 + 合成事件 + `stop_event`/`yield` 取舍）→ `outbox.py` → `watchdog.py`。
+### 7.1 后续三块（已完成）
+
+| 模块 | 文件 | 验证 |
+|---|---|---|
+| Outbox（可靠投递） | `superbot/outbox.py` | 13 单测 + e2e 实发 |
+| Watchdog（停滞检测） | `superbot/watchdog.py` | 12 单测 |
+| Router（单槽 + 只追加 + 批处理） | `superbot/router.py` | 14 单测 + e2e batch=3 |
+| Worker（并发上限 + 可取消） | `superbot/worker.py` | 14 单测 + e2e worker done |
+
+**e2e 全链路**：Gate → Router（批处理）→ Worker（执行）→ Outbox（投递）→ `send_message`
+—— 12 项断言全绿，见 `docs/测试环境.md`。
+
+### 7.2 仍未做
+
+- `P5`：把桩评估器换成真模型（`Context.tool_loop_agent`）、Worker 接沙箱
+- `P4`：Thread 订阅直通（事件绕过 Router 直达 Worker）
+- 取消链路在真实例里的验证（单测已覆盖 `task.cancel` 语义）

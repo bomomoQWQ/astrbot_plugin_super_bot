@@ -1,4 +1,4 @@
-﻿"""Gate（准入层）单测。
+"""Gate（准入层）单测。
 
 对应 docs/设计/20-p0-spec.md §4 的前五条与第八条。
 全部纯逻辑，不需要 AstrBot 在场。
@@ -188,3 +188,43 @@ def test_command_beats_whitelist():
 def test_decision_bool_matches_route():
     assert bool(decide(_view())) is True
     assert bool(decide(_view(sender_id="10000"))) is False
+
+
+# ---------------------------------------------------------------------------
+# 规则 2.5：显式呼叫（woken）
+# ---------------------------------------------------------------------------
+
+
+def test_woken_goes_to_native():
+    """被 @ / 唤醒前缀 / 私聊唤醒的消息，P3 阶段先交给原生主 agent。"""
+    d = decide(_view(woken=True))
+    assert d.verdict is Verdict.PASS
+    assert d.reason == "explicit_call"
+
+
+def test_not_woken_routes():
+    """群里没人叫它（is_wake 但非 is_at_or_wake_command）→ 交给 Router。"""
+    assert decide(_view(woken=False)).verdict is Verdict.ROUTE
+
+
+def test_self_message_beats_woken():
+    """自己发的 @ 消息也不能放行——防回环优先于一切。"""
+    d = decide(_view(sender_id="10000", woken=True))
+    assert d.verdict is Verdict.IGNORE
+
+
+def test_command_beats_woken():
+    """指令（带唤醒前缀）优先于 woken 判定，原因相同但语义更明确。"""
+    conf = GateConfig(command_names=frozenset({"help"}))
+    d = decide(_view(message_str="help", woken=True), conf)
+    assert d.verdict is Verdict.PASS
+    assert d.reason == "command"
+
+
+def test_woken_beats_rate_limit():
+    """@ 机器人是明确请求，不该被来源节流挡掉（否则用户会觉得"它不理我"）。"""
+    limiter = RateLimiter(limit=1, window_sec=60)
+    conf = GateConfig(rate_limit=1)
+    decide(_view(), conf, limiter, now=0.0)  # 用掉配额
+    d = decide(_view(woken=True), conf, limiter, now=1.0)
+    assert d.verdict is Verdict.PASS

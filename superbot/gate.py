@@ -75,6 +75,13 @@ class EventView:
     message_str: str
     umo: str
     session_isolated: bool = False
+    woken: bool = False
+    """是否被显式呼叫（对应 ``event.is_at_or_wake_command``）。
+
+    与 ``is_wake`` 不同：``waking_check/stage.py`` 只在「@ 机器人 / 唤醒前缀 /
+    私聊」时置 ``is_at_or_wake_command``（:128/:149/:158），而**任何**插件
+    filter 通过都会置 ``is_wake``（:232）。前者才决定主 agent 跑不跑。
+    """
 
     @property
     def chat_key(self) -> str:
@@ -187,6 +194,17 @@ def decide(
     # 规则 2：指令放行。
     if _looks_like_command(view.message_str, conf):
         return GateDecision(Verdict.PASS, "command")
+
+    # 规则 2.5：显式呼叫先交给原生流程（**临时策略**）。
+    #
+    # 按最终设计（ADR-02），Router 应当拥有全部人类交互。但 P3 阶段 Router 只说
+    # 确定性桩语，让它接管 @ 消息体验会很差。所以先放行给 AstrBot 自带的主 agent；
+    # 等评估器接上模型（P5）后再改回 ROUTE。
+    #
+    # 注意这里的取舍：放行且不 yield，主 agent 正常回答——正是要的；反之若判成
+    # ROUTE 却又不 yield，就会"Router 和主 agent 各回一次"。
+    if view.woken:
+        return GateDecision(Verdict.PASS, "explicit_call")
 
     # 规则 3：来源白名单。程序层，绝不调模型。
     if conf.allowed_sources and view.chat_key not in conf.allowed_sources:

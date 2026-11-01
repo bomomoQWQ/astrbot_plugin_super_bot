@@ -171,6 +171,8 @@ class AstrBotInstance:
     llm_port: int = FAKE_LLM_PORT
     config: dict[str, Any] | None = None
     boot_timeout: float = 90.0
+    extra_env: dict[str, str] = field(default_factory=dict)
+    """额外环境变量（例如 ``SUPERBOT_EVAL_MODE=echo`` 切桩评估器行为）。"""
 
     proc: subprocess.Popen | None = None
     log_path: Path = field(default=RUNTIME_DIR / "logs" / "astrbot.log")
@@ -201,6 +203,7 @@ class AstrBotInstance:
         env["PYTHONPATH"] = str(astrbot_src())
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
+        env.update(self.extra_env)
 
         self._log_fp = open(self.log_path, "w", encoding="utf-8", buffering=1)
         self.proc = subprocess.Popen(
