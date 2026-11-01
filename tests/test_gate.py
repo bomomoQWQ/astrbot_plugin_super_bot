@@ -1,4 +1,4 @@
-"""Gate（准入层）单测。
+﻿"""Gate（准入层）单测。
 
 对应 docs/设计/20-p0-spec.md §4 的前五条与第八条。
 全部纯逻辑，不需要 AstrBot 在场。
@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from core.gate import EventView, GateConfig, RateLimiter, Verdict, decide
+from superbot.gate import EventView, GateConfig, RateLimiter, Verdict, decide
 
 
 def _view(**kw) -> EventView:

@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
@@ -9,3 +9,4 @@ data/
 .venv/
 venv/
 .DS_Store
+.runtime/

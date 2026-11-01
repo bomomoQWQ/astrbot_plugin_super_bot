@@ -1,4 +1,4 @@
-"""Thread 指纹与幂等键单测。
+﻿"""Thread 指纹与幂等键单测。
 
 对应 docs/设计/20-p0-spec.md §4 的第六、七条。
 最关键的断言是 ``test_same_group_same_key_regardless_of_unique_session``：
@@ -7,8 +7,8 @@
 
 from __future__ import annotations
 
-from core.gate import EventView
-from core.thread_key import (
+from superbot.gate import EventView
+from superbot.thread_key import (
     explicit_tag,
     local_date,
     stable_key,

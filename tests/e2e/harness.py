@@ -1,0 +1,268 @@
+"""本地 AstrBot 实例的生命周期管理。
+
+约定：
+
+- **AstrBot 源码**：默认 ``F:/理解痞老板/AstrBot``，可用 ``ASTRBOT_SRC`` 覆盖。
+  只读使用，绝不修改（它的 ``data/`` 指向我们的运行目录）。
+- **运行目录**：仓库下 ``.runtime/``，用 ``ASTRBOT_ROOT`` 环境变量指定，
+  于是 ``data/``、``plugin_data/`` 全部落在 ``.runtime/data`` 里，
+  不污染用户那份源码 checkout。
+- **插件接入**：在 ``.runtime/data/plugins/`` 建一个目录联接（junction）指向
+  本仓库根目录，名字用合法模块名 ``astrbot_plugin_super_bot``。
+  改本地代码即生效，无需复制。
+
+用法（在 pytest 里）::
+
+    async with AstrBotInstance() as env:
+        bot = FakeOneBot(port=env.onebot_port)
+        await bot.connect()
+        ...
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+__all__ = ["AstrBotInstance", "PLUGIN_MODULE_NAME", "REPO_ROOT", "RUNTIME_DIR"]
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_DIR = REPO_ROOT / ".runtime"
+DATA_DIR = RUNTIME_DIR / "data"
+PLUGINS_DIR = DATA_DIR / "plugins"
+LOGS_DIR = RUNTIME_DIR / "logs"
+
+PLUGIN_MODULE_NAME = "astrbot_plugin_super_bot"
+"""插件在 data/plugins 下的目录名，必须是合法模块名。"""
+
+
+def astrbot_src() -> Path:
+    raw = os.environ.get("ASTRBOT_SRC", r"F:\理解痞老板\AstrBot")
+    return Path(raw).resolve()
+
+
+# ---------------------------------------------------------------------------
+# 配置
+# ---------------------------------------------------------------------------
+
+FAKE_LLM_PORT = 8180
+ONEBOT_PORT = 6199
+
+
+def build_config(
+    *,
+    onebot_port: int = ONEBOT_PORT,
+    llm_port: int = FAKE_LLM_PORT,
+    admins: list[str] | None = None,
+    unique_session: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """最小配置；缺失项由 AstrBot 的 check_config_integrity 自动补齐。
+
+    依据：
+    - aiocqhttp 平台模板见 ``astrbot/core/config/default.py:345-352``
+    - openai 兼容 provider 模板见 ``:1294-1305``
+    - ``model`` 是顶层字段（``utils/migra_helper.py:403-406`` 会把旧的
+      ``model_config.model`` 迁移过来）
+    """
+    cfg: dict[str, Any] = {
+        "platform": [
+            {
+                "id": "onebot-local",
+                "type": "aiocqhttp",
+                "enable": True,
+                "ws_reverse_host": "127.0.0.1",
+                "ws_reverse_port": onebot_port,
+                "ws_reverse_token": "",
+            }
+        ],
+        "provider": [
+            {
+                "id": "fake-llm",
+                "provider": "openai",
+                "type": "openai_chat_completion",
+                "provider_type": "chat_completion",
+                "enable": True,
+                "key": ["sk-fake"],
+                "api_base": f"http://127.0.0.1:{llm_port}/v1",
+                "timeout": 60,
+                "proxy": "",
+                "custom_headers": {},
+                "model": "fake-model",
+            }
+        ],
+        "provider_settings": {
+            "enable": True,
+            "provider_pool": ["*"],
+            "streaming_response": False,
+            "computer_use_runtime": "none",
+            "reachability_check": False,
+        },
+        "wake_prefix": ["/"],
+        "admins_id": admins if admins is not None else ["20001"],
+        "plugin_set": ["*"],
+        "platform_settings": {"unique_session": unique_session},
+    }
+    if extra:
+        cfg.update(extra)
+    return cfg
+
+
+def write_config(cfg: dict[str, Any]) -> Path:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "cmd_config.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=4), encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 插件接入
+# ---------------------------------------------------------------------------
+
+
+def ensure_plugin_link() -> Path:
+    """把仓库根目录联接到 ``data/plugins/astrbot_plugin_super_bot``。"""
+    PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+    link = PLUGINS_DIR / PLUGIN_MODULE_NAME
+    if link.exists() or link.is_symlink():
+        # 已存在就删掉重建，确保指向正确
+        if link.is_dir() and not link.is_symlink():
+            try:
+                link.rmdir()
+            except OSError:
+                # junction 需要特殊删除
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", str(link)], check=False, capture_output=True
+                )
+    if not link.exists():
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(REPO_ROOT)],
+            check=True,
+            capture_output=True,
+        )
+    return link
+
+
+# ---------------------------------------------------------------------------
+# 实例
+# ---------------------------------------------------------------------------
+
+
+def _port_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
+@dataclass
+class AstrBotInstance:
+    """一个跑在子进程里的 AstrBot。"""
+
+    onebot_port: int = ONEBOT_PORT
+    llm_port: int = FAKE_LLM_PORT
+    config: dict[str, Any] | None = None
+    boot_timeout: float = 90.0
+
+    proc: subprocess.Popen | None = None
+    log_path: Path = field(default=RUNTIME_DIR / "logs" / "astrbot.log")
+
+    # -- 上下文管理 -------------------------------------------------------
+
+    async def __aenter__(self) -> "AstrBotInstance":
+        await self.start()
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.stop()
+
+    # -- 启动 / 停止 -------------------------------------------------------
+
+    async def start(self) -> None:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self.log_path = LOGS_DIR / "astrbot.log"
+        write_config(
+            self.config
+            if self.config is not None
+            else build_config(onebot_port=self.onebot_port, llm_port=self.llm_port)
+        )
+        ensure_plugin_link()
+
+        env = os.environ.copy()
+        env["ASTRBOT_ROOT"] = str(RUNTIME_DIR)
+        env["PYTHONPATH"] = str(astrbot_src())
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        self._log_fp = open(self.log_path, "w", encoding="utf-8", buffering=1)
+        self.proc = subprocess.Popen(
+            [sys.executable, str(astrbot_src() / "main.py")],
+            cwd=str(RUNTIME_DIR),
+            env=env,
+            stdout=self._log_fp,
+            stderr=subprocess.STDOUT,
+        )
+        await self.wait_ready()
+
+    async def wait_ready(self, timeout: float | None = None) -> None:
+        """等到 OneBot 端口可连接，或日志出现适配器已连接。"""
+        deadline = time.monotonic() + (timeout or self.boot_timeout)
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"AstrBot 提前退出（code={self.proc.returncode}）。\n--- 日志尾部 ---\n"
+                    + self.log_tail(60)
+                )
+            if _port_open("127.0.0.1", self.onebot_port):
+                # 端口开了说明 aiocqhttp 已起；再给它一点时间加载插件
+                await asyncio.sleep(1.5)
+                return
+            if "适配器已连接" in self.log_tail(200):
+                return
+            await asyncio.sleep(0.5)
+        raise TimeoutError(
+            "AstrBot 未在预期时间内就绪。\n--- 日志尾部 ---\n" + self.log_tail(80)
+        )
+
+    async def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                await asyncio.to_thread(self.proc.wait, 15)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                await asyncio.to_thread(self.proc.wait, 10)
+        self.proc = None
+        fp = getattr(self, "_log_fp", None)
+        if fp is not None:
+            fp.close()
+            self._log_fp = None
+
+    # -- 日志 -------------------------------------------------------------
+
+    def log_text(self) -> str:
+        if not self.log_path.exists():
+            return ""
+        return self.log_path.read_text(encoding="utf-8", errors="replace")
+
+    def log_tail(self, lines: int = 40) -> str:
+        text = self.log_text()
+        if not text:
+            return "(日志为空)"
+        return "\n".join(text.splitlines()[-lines:])
+
+    async def wait_log(self, needle: str, timeout: float = 30.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if needle in self.log_text():
+                return True
+            await asyncio.sleep(0.3)
+        return False

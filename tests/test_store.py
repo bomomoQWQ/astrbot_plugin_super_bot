@@ -1,4 +1,4 @@
-"""状态库单测。
+﻿"""状态库单测。
 
 覆盖 docs/设计/20-p0-spec.md §4 的第九、十、十一、十二与十三条：
 迁移、幂等、状态由事实算出、并发写入、清理。
@@ -10,8 +10,8 @@ import asyncio
 
 import pytest
 
-from core import limits
-from core.store import (
+from superbot import limits
+from superbot.store import (
     DispositionRow,
     Store,
     TicketRow,
@@ -200,7 +200,7 @@ async def test_create_ticket_idempotent(store):
 
 async def test_one_eval_one_ticket(store):
     """同一 eval 派生的 ticket id 相同 → 重复创建只会命中一次。"""
-    from core.thread_key import ticket_id_from_eval
+    from superbot.thread_key import ticket_id_from_eval
 
     tid = ticket_id_from_eval("eval-1")
     assert await store.create_ticket(TicketRow(tid, "T", "{}", 1.0)) is True
