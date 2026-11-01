@@ -1,0 +1,75 @@
+{
+  "gate": {
+    "type": "object",
+    "description": "准入规则（Gate）—— 纯程序判定，不消耗模型",
+    "items": {
+      "bot_ids": {
+        "type": "list",
+        "description": "额外要当成“自己”的身份。用于防回环：机器人自己发出的消息会被丢弃",
+        "default": ["astrbot"]
+      },
+      "wake_prefixes": {
+        "type": "list",
+        "description": "唤醒前缀。以此开头的消息视为指令，直接交给 AstrBot 原生流程",
+        "default": ["/"]
+      },
+      "command_names": {
+        "type": "list",
+        "description": "无前缀也算指令的首词（可选，一般留空）",
+        "default": []
+      },
+      "allowed_sources": {
+        "type": "list",
+        "description": "允许的来源白名单，格式 平台:群号（如 aiocqhttp:123456）。留空＝全部放行",
+        "default": []
+      },
+      "rate_limit": {
+        "type": "int",
+        "description": "同一来源在窗口内最多放行多少条，超过直接丢弃",
+        "default": 30
+      },
+      "rate_window_sec": {
+        "type": "float",
+        "description": "限流窗口长度（秒）",
+        "default": 60.0
+      }
+    }
+  },
+  "agent": {
+    "type": "object",
+    "description": "任务执行（Router / Worker）—— 默认全关，不会碰模型也不会开容器",
+    "items": {
+      "eval_mode": {
+        "type": "string",
+        "description": "ignore＝只判定不回话；echo＝确定性回显（调试）；live＝用真模型判断怎么回",
+        "options": ["ignore", "echo", "live"],
+        "default": "ignore"
+      },
+      "sandbox": {
+        "type": "bool",
+        "description": "开启后 Worker 在 Shipyard Neo 沙箱里真干活（需要下面的 Bay 地址与密钥）",
+        "default": false
+      },
+      "agent_steps": {
+        "type": "int",
+        "description": "Worker 的工具循环最多几步（越多越贵）",
+        "default": 6
+      },
+      "bay_endpoint": {
+        "type": "string",
+        "description": "Shipyard Neo（Bay）的地址",
+        "default": "http://localhost:8114"
+      },
+      "bay_api_key": {
+        "type": "string",
+        "description": "Bay 的 API key（sk-bay-…）。留空则读环境变量 BAY_API_KEY 或 .runtime/bay_key.txt",
+        "default": ""
+      },
+      "keepalive_sec": {
+        "type": "float",
+        "description": "沙箱保活间隔（秒）。必须小于 Bay 的 TTL，否则工作区会被级联删除",
+        "default": 1200.0
+      }
+    }
+  }
+}

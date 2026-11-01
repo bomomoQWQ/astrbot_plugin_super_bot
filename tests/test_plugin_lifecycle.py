@@ -299,3 +299,71 @@ async def test_no_sandbox_ids_means_no_calls(plugin, monkeypatch):
         assert fake.kept == [], "没有活跃沙箱时不该发请求"
     finally:
         await plugin.terminate()
+
+
+# ---------------------------------------------------------------------------
+# 配置优先级：Dashboard 配置 > 环境变量 > 默认值
+# ---------------------------------------------------------------------------
+
+
+def test_env_beats_config_for_eval_mode(plugin_mod, monkeypatch):
+    """环境变量压过 Dashboard 配置。
+
+    这条是被真事逼出来的：AstrBot 装完插件就按 schema 生成一份默认配置
+    （``eval_mode: "ignore"``）。若配置优先，任何用环境变量控制行为的部署
+    （容器编排、CI、我们的 e2e）都会被这份默认值悄悄盖掉——排查了很久。
+    """
+    monkeypatch.setenv("SUPERBOT_EVAL_MODE", "live")
+    plugin_mod.configure({"agent": {"eval_mode": "echo"}})
+    assert plugin_mod._eval_mode() == "live"
+    assert plugin_mod._eval_mode_source() == "env"
+
+
+def test_config_used_when_env_absent(plugin_mod, monkeypatch):
+    """用户正常用法：不设环境变量，只在 Dashboard 里改。"""
+    monkeypatch.delenv("SUPERBOT_EVAL_MODE", raising=False)
+    plugin_mod.configure({"agent": {"eval_mode": "echo"}})
+    assert plugin_mod._eval_mode() == "echo"
+    assert plugin_mod._eval_mode_source() == "config"
+
+    plugin_mod.configure({})
+    assert plugin_mod._eval_mode() == "ignore"
+    assert plugin_mod._eval_mode_source() == "default"
+
+
+def test_config_sandbox_flag(plugin_mod, monkeypatch):
+    monkeypatch.delenv("SUPERBOT_SANDBOX", raising=False)
+    plugin_mod.configure({"agent": {"sandbox": True}})
+    assert plugin_mod._sandbox_enabled() is True
+    plugin_mod.configure({"agent": {"sandbox": False}})
+    assert plugin_mod._sandbox_enabled() is False
+    plugin_mod.configure({})
+    assert plugin_mod._sandbox_enabled() is False  # 默认关
+
+
+def test_config_agent_steps_clamped(plugin_mod):
+    plugin_mod.configure({"agent": {"agent_steps": 0}})
+    assert plugin_mod._agent_max_steps() == 1
+    plugin_mod.configure({"agent": {"agent_steps": 999}})
+    assert plugin_mod._agent_max_steps() == 20
+    plugin_mod.configure({})
+    assert plugin_mod._agent_max_steps() == 6
+
+
+def test_config_bay_settings(plugin_mod, monkeypatch):
+    monkeypatch.delenv("BAY_API_KEY", raising=False)
+    plugin_mod.configure(
+        {"agent": {"bay_endpoint": "http://bay:9999", "bay_api_key": "sk-bay-from-config"}}
+    )
+    assert plugin_mod._bay_endpoint() == "http://bay:9999"
+    assert plugin_mod._bay_key() == "sk-bay-from-config"
+    plugin_mod.configure({})
+
+
+def test_gate_conf_reads_gate_section(plugin, plugin_mod):
+    """``gate`` 段里的阈值要真的进到 GateConfig 里。"""
+    plugin_mod.configure({"gate": {"rate_limit": 7, "rate_window_sec": 12.5}})
+    conf = plugin._build_gate_conf()
+    assert conf.rate_limit == 7
+    assert conf.rate_window_sec == 12.5
+    plugin_mod.configure({})

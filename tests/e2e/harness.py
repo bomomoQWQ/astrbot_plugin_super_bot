@@ -76,6 +76,9 @@ def astrbot_src() -> Path:
 
 FAKE_LLM_PORT = 8180
 ONEBOT_PORT = 6199
+DASHBOARD_PORT = 6185
+"""AstrBot 的 WebUI 端口。**必须**也检查有没有被占——不检查的话，上一轮 e2e
+泄漏的进程会让你以为"配置没生效"，实际是新实例启动到一半就退出去了。"""
 
 
 def build_config(
@@ -142,6 +145,25 @@ def write_config(cfg: dict[str, Any]) -> Path:
     path = DATA_DIR / "cmd_config.json"
     path.write_text(json.dumps(cfg, ensure_ascii=False, indent=4), encoding="utf-8")
     return path
+
+
+def write_plugin_config(cfg: dict[str, Any]) -> Path:
+    """写插件自己的配置（Dashboard 里那张表单存的地方）。
+
+    路径是 ``data/config/<插件目录名>_config.json``（``star_manager.py:206,1164-1169``），
+    结构由插件根目录的 ``_conf_schema.json`` 决定。
+    """
+    path = RUNTIME_DIR / "data" / "config" / f"{PLUGIN_MODULE_NAME}_config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def clear_plugin_config() -> None:
+    """删掉插件配置，回到"AstrBot 按 schema 生成默认值"的状态。"""
+    path = RUNTIME_DIR / "data" / "config" / f"{PLUGIN_MODULE_NAME}_config.json"
+    if path.exists():
+        path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +298,20 @@ class AstrBotInstance:
             else build_config(onebot_port=self.onebot_port, llm_port=self.llm_port)
         )
         ensure_plugin_link()
+
+        # 上一轮泄漏的进程会占着这两个端口，症状很隐蔽（新实例启动到一半退出，
+        # 日志里却是"配置没生效"）。所以先查，查到了就明确报错。
+        for port, label in (
+            (self.onebot_port, "OneBot"),
+            (DASHBOARD_PORT, "Dashboard"),
+        ):
+            if _port_open("127.0.0.1", port):
+                raise RuntimeError(
+                    f"端口 {port}（{label}）已被占用，多半是上一轮 e2e 的残留进程。"
+                    f"先把它关掉再跑：Get-CimInstance Win32_Process | "
+                    f"Where-Object {{ $_.CommandLine -like '*AstrBot*main.py*' }} | "
+                    f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+                )
 
         env = os.environ.copy()
         env["ASTRBOT_ROOT"] = str(RUNTIME_DIR)

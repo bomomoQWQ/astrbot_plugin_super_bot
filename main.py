@@ -298,6 +298,10 @@ class SuperBotPlugin(star.Star):
 
     def __init__(self, context: star.Context, config: dict | None = None) -> None:
         super().__init__(context, config)
+        # ⚠ 基类 Star.__init__ 只存 self.context，**不存 config**（base.py:28-29），
+        # 所以必须自己留一份，否则 initialize 里读 self.config 会拿到 None。
+        self._raw_config: dict = config if isinstance(config, dict) else {}
+        configure(self._raw_config)
         self._store: Store | None = None
         self._limiter: RateLimiter | None = None
         self._gate_conf: GateConfig | None = None
@@ -320,6 +324,7 @@ class SuperBotPlugin(star.Star):
 
     async def initialize(self) -> None:
         started = time.perf_counter()
+        configure(self._raw_config)  # Dashboard 配置优先于环境变量
         data_dir = _resolve_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -340,7 +345,7 @@ class SuperBotPlugin(star.Star):
 
         # 沙箱（可选）：一个 Ticket 一个 sandbox，自己直连 Bay
         if _sandbox_enabled():
-            endpoint = os.environ.get(BAY_ENDPOINT_ENV) or "http://localhost:8114"
+            endpoint = _bay_endpoint()
             key = _bay_key()
             if key:
                 self._sandbox = BaySandbox(endpoint=endpoint, api_key=key, ttl=3600)
@@ -365,12 +370,13 @@ class SuperBotPlugin(star.Star):
             "%s loaded as %s (package=%r)", LOG_TAG, __name__, __package__
         )
         logger.info(
-            "%s initialized: db=%s schema=v%s self_id=%s eval_mode=%s",
+            "%s initialized: db=%s schema=v%s self_id=%s eval_mode=%s(from %s)",
             LOG_TAG,
             data_dir / limits.DB_FILENAME,
             await self._store.schema_version(),
             self._gate_conf.bot_ids,
             _eval_mode(),
+            _eval_mode_source(),
         )
         logger.info(
             "%s startup took %.0f ms", LOG_TAG, (time.perf_counter() - started) * 1000
@@ -437,11 +443,11 @@ class SuperBotPlugin(star.Star):
     # -- 配置 ---------------------------------------------------------------
 
     def _build_gate_conf(self) -> GateConfig:
-        """从插件配置读；缺省即"不过滤"，便于冷启动先跑通。"""
-        cfg: dict[str, Any] = {}
-        raw = getattr(self, "config", None)
-        if isinstance(raw, dict):
-            cfg = raw.get("gate", {}) if isinstance(raw.get("gate"), dict) else raw
+        """从插件配置的 ``gate`` 段读；缺省即"不过滤"，便于冷启动先跑通。"""
+        cfg = _conf_get("gate")
+        if not isinstance(cfg, dict):
+            # 兼容没有 ``gate`` 分组的旧配置：直接当平铺结构读
+            cfg = _CONF
 
         return GateConfig(
             bot_ids=frozenset(str(x) for x in (cfg.get("bot_ids") or ["astrbot"])),
@@ -964,12 +970,71 @@ class SuperBotPlugin(star.Star):
 
 
 # ---------------------------------------------------------------------------
-# 桩评估器的环境配置
+# 配置读取：Dashboard 配置 > 环境变量 > 默认值
 # ---------------------------------------------------------------------------
+
+_CONF: dict[str, Any] = {}
+"""插件配置（``data/config/<插件名>_config.json``，由 ``_conf_schema.json`` 定义结构）。
+
+在 ``initialize()`` 里通过 :func:`configure` 注入。放在模块级而不是方法里，
+是为了让这些读配置的小函数保持纯函数、也方便单测直接调。
+"""
+
+
+def configure(conf: Any) -> None:
+    """注入插件配置。传非 dict 则视为空配置。"""
+    global _CONF
+    _CONF = conf if isinstance(conf, dict) else {}
+
+
+def _conf_get(*path: str) -> Any:
+    """按点路径取配置值，取不到返回 ``None``。"""
+    cur: Any = _CONF
+    for key in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(key)
+        if cur is None:
+            return None
+    return cur
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _eval_mode_source() -> str:
+    """``eval_mode`` 最终是从哪来的：``env`` / ``config`` / ``default``。
+
+    为什么要记：两个来源同时能设时，"我明明改了 Dashboard 怎么没反应"是最难查的
+    问题。启动日志里直接写清楚。
+    """
+    if os.environ.get(EVAL_MODE_ENV):
+        return "env"
+    v = _conf_get("agent", "eval_mode")
+    return "config" if isinstance(v, str) and v.strip() else "default"
 
 
 def _eval_mode() -> str:
-    return (os.environ.get(EVAL_MODE_ENV) or "ignore").strip().lower()
+    """评估器模式。
+
+    优先级：**环境变量 > Dashboard 配置 > 默认 ``ignore``**。
+
+    为什么环境变量优先：AstrBot 装完插件就会按 schema 生成一份默认配置
+    （``eval_mode: "ignore"``），如果配置优先，那么任何用环境变量控制行为的
+    部署（容器编排、测试）都会被这份默认值悄悄盖掉——踩过一次，很难查。
+
+    用户正常的用法是只在 Dashboard 里改，环境变量一个都不设，此时等价于配置优先。
+    """
+    v = os.environ.get(EVAL_MODE_ENV)
+    if v and v.strip():
+        return v.strip().lower()
+    c = _conf_get("agent", "eval_mode")
+    if isinstance(c, str) and c.strip():
+        return c.strip().lower()
+    return "ignore"
 
 
 def _eval_delay() -> float:
@@ -999,12 +1064,14 @@ def _keepalive_interval() -> float:
     下限取 0.05 而不是 1：既挡住 0/负数（会变成忙等），又让测试能用小间隔
     真的观察到循环在跑。生产上没人会配这个值。
     """
-    raw = os.environ.get(KEEPALIVE_ENV)
+    raw = _conf_get("agent", "keepalive_sec")
+    if os.environ.get(KEEPALIVE_ENV):
+        raw = os.environ.get(KEEPALIVE_ENV)
     if raw is None:
         return 1200.0
     try:
         return max(0.05, float(raw))
-    except ValueError:
+    except (TypeError, ValueError):
         return 1200.0
 
 
@@ -1013,12 +1080,14 @@ def _agent_max_steps() -> int:
 
     6 步够"查一次 → 算一次 → 汇总"这种典型任务；再多就是在烧钱绕圈。
     """
-    raw = os.environ.get(AGENT_STEPS_ENV)
+    raw = _conf_get("agent", "agent_steps")
+    if os.environ.get(AGENT_STEPS_ENV):
+        raw = os.environ.get(AGENT_STEPS_ENV)
     if raw is None:
         return 6
     try:
         return max(1, min(20, int(raw)))
-    except ValueError:
+    except (TypeError, ValueError):
         return 6
 
 
@@ -1034,22 +1103,34 @@ def _sandbox_hold() -> float:
 
 
 def _sandbox_enabled() -> bool:
-    return (os.environ.get(SANDBOX_ENV) or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+    """是否在沙箱里执行。优先级同 ``_eval_mode``：环境变量 > 配置 > 默认关。"""
+    raw = os.environ.get(SANDBOX_ENV)
+    if raw is not None and raw.strip() != "":
+        return _as_bool(raw)
+    v = _conf_get("agent", "sandbox")
+    return _as_bool(v) if v is not None else False
+
+
+def _bay_endpoint() -> str:
+    if v := os.environ.get(BAY_ENDPOINT_ENV):
+        return v.strip()
+    c = _conf_get("agent", "bay_endpoint")
+    if isinstance(c, str) and c.strip():
+        return c.strip()
+    return "http://localhost:8114"
 
 
 def _bay_key() -> str | None:
-    """Bay 的 API key：环境变量优先，其次 ``.runtime/bay_key.txt``。
+    """Bay 的 API key：环境变量 > 配置 > ``.runtime/bay_key.txt``。
 
     ⚠ 读文件时用 ``utf-8-sig`` —— PowerShell 5.1 的 ``Set-Content -Encoding utf8``
     会写 BOM，带着 BOM 的 key 会被 Bay 判为 401（我们踩过）。
     """
     if k := os.environ.get(BAY_KEY_ENV):
         return k.strip()
+    c = _conf_get("agent", "bay_api_key")
+    if isinstance(c, str) and c.strip():
+        return c.strip()
     p = _HERE / ".runtime" / "bay_key.txt"
     if p.exists():
         return p.read_text(encoding="utf-8-sig").strip()
