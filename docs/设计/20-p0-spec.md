@@ -279,3 +279,30 @@ Router 循环（P3）、Thread 订阅直通（P4）、Worker（P5）、沙箱（
 1. **插件内用相对导入**（`from .core.gate import ...`）。插件模块名是 `data.plugins.<name>.main`（`api/__init__.py:19` 的 `_PLUGIN_MODULE_ROOTS`），依赖安装目录名，不可硬编码。
 2. **`terminate()` 必须直接定义在插件类里**。卸载逻辑检查 `"terminate" in star_cls_type.__dict__`（`star_manager.py:1962-1963`）——继承来的不会被调用，循环就停不下来。
 3. **`terminate()` 里先 `await sp.flush()` 再关库**。插件更新前只给这一次回调（`star_manager.py:2107`），漏了就丢最后一批写入。
+
+---
+
+## 7. 实现状态（2026-11-01）
+
+P0 三块已落地并通过单测（commit `7418ea8`）。
+
+| 模块 | 文件 | 状态 | 单测 |
+|---|---|---|---|
+| Gate（四条规则） | `core/gate.py` | ✅ | 22 |
+| Thread 指纹 / 幂等键 | `core/thread_key.py` | ✅ | 25 |
+| 状态库（SQLite + 迁移链） | `core/store.py` | ✅ | 26 |
+| 阈值集中 | `core/limits.py` | ✅ | — |
+| **合计** | | | **73 passed / 0.98s** |
+
+实现时相对本规格的**两处调整**（不改变语义，只让测试更容易）：
+
+1. **`EventView` 代替 `AstrMessageEvent`**：`gate.decide()` 与 `thread_key.thread_key()` 吃的是一个 frozen dataclass（`core/gate.py::EventView`），由 `main.py` 的适配层从真实事件抽取。于是这三个模块**完全不 import astrbot**，在任何 Python 3.10+ 环境都能测。
+2. **写操作串行化用 `asyncio.Lock` + 单连接**，而不是复刻 `SharedPreferences` 的 FIFO 队列——单实例部署下语义等价，代码少一半。跨进程仍可加 `filelock`。
+
+尚未验证的验收项（需要 AstrBot 在场，即远程服务器）：
+
+- 装进 `data/plugins/` 能加载
+- 日志里能看到每条消息的 `GateDecision.reason`
+- 普通闲聊不触发主 agent、`/stop` 能停
+
+下一步实现顺序：`main.py` 适配层（`EventView` 抽取 + 合成事件 + `stop_event`/`yield` 取舍）→ `outbox.py` → `watchdog.py`。
