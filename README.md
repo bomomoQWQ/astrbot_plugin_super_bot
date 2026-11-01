@@ -32,7 +32,7 @@ AstrBot 默认的链路是"一条消息 → 一次模型调用 → 一次回复"
 |---|---|
 | **Gate** | 四层确定性准入：自消息防回环、指令放行、来源白名单、滑动窗口限流。纯程序判定，**不调模型** |
 | **Router** | 单槽 + 只追加的批处理。评估进行期间到达的消息自动合并；不用定时器，也没有"窗口多长"这种拍脑袋参数 |
-| **Worker** | 一个任务一张工单，并发上限、协作式取消。可接 Shipyard Neo 沙箱隔离执行 |
+| **Worker** | 一个任务一张工单。模型在**真沙箱**里调工具干活（`run_python` / `run_shell` / 读写文件），并发上限、协作式取消 |
 | **Outbox** | 同一会话串行发送、失败退避重试、幂等入队（重试不会重复刷屏） |
 | **Watchdog** | 停滞检测 → 退避重试 → 逐级升级 → 判死。不靠"看起来在跑" |
 | **Thread 指纹** | 同一话题自动归拢：显式标记 > 引用消息 > 话题 > 按天 |
@@ -69,7 +69,8 @@ httpx>=0.27
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `SUPERBOT_EVAL_MODE` | `ignore` | `ignore` 只判定不回话 / `echo` 确定性回显（调试用）/ `live` 走真模型 |
-| `SUPERBOT_SANDBOX` | 关 | `1` = Worker 在 Shipyard Neo 沙箱里执行 |
+| `SUPERBOT_SANDBOX` | 关 | `1` = Worker 在 Shipyard Neo 沙箱里真干活 |
+| `SUPERBOT_AGENT_STEPS` | `6` | Worker 的工具循环上限（步数越多越贵） |
 | `BAY_ENDPOINT` | `http://localhost:8114` | Bay 地址 |
 | `BAY_API_KEY` | 空 | Bay 的 API key |
 | `SUPERBOT_KEEPALIVE_SEC` | `1200` | 沙箱保活间隔（**必须**小于 TTL，否则工作区会被级联删除） |
@@ -86,9 +87,10 @@ httpx>=0.27
 
 ## 已知限制
 
-- `SUPERBOT_EVAL_MODE=live` 需要你自己配好 provider；默认不会碰模型
-- 沙箱能力依赖外部 Shipyard Neo 部署，不配也能跑（Worker 走桩）
-- 目前是**确定性准入 + 骨架**，Router 的"评估器"还很朴素；设计文档在 `docs/`
+- `SUPERBOT_EVAL_MODE=live` 与 `SUPERBOT_SANDBOX=1` 需要你自己配好 provider 与 Shipyard Neo；
+  默认是 `ignore`，装上不会碰模型、也不会开容器
+- 沙箱能力依赖外部 Shipyard Neo 部署，不配也能跑（Worker 退回桩执行）
+- Router 的"要不要理、怎么理"还是很朴素的一句话判断；复杂编排留给后续版本
 
 ---
 

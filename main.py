@@ -122,6 +122,18 @@ except Exception as _exc:  # noqa: BLE001
     make_synthetic_event = None  # type: ignore[assignment]
     _SYNTHETIC_ERR = f"{type(_exc).__name__}: {_exc}"
 
+# 沙箱工具集同理：它依赖 astrbot.api 的 FunctionTool/ToolSet（公开 API）。
+# 拿不到就退回桩执行——插件照样能装能跑。
+try:
+    if __package__:
+        from .superbot.toolset import build_sandbox_tools
+    else:
+        from superbot.toolset import build_sandbox_tools
+    _TOOLSET_ERR: str | None = None
+except Exception as _exc2:  # noqa: BLE001
+    build_sandbox_tools = None  # type: ignore[assignment]
+    _TOOLSET_ERR = f"{type(_exc2).__name__}: {_exc2}"
+
 # 让框架自带的 /stop 能停到我们：把每个会话的活跃任务登记进 ActiveEventRegistry。
 # 这个模块是 AstrBot 内置命令用的同一个（builtin_stars/builtin_commands/commands/
 # conversation.py:117-122），所以 `/stop` 会顺着它找到我们，不需要我们自己拦截命令。
@@ -166,6 +178,9 @@ WORKER_DELAY_ENV = "SUPERBOT_WORKER_DELAY"
 
 测试 ``/stop`` 时要把它调大（比如 30），否则任务结束得太快、来不及取消。
 """
+
+AGENT_STEPS_ENV = "SUPERBOT_AGENT_STEPS"
+"""Worker 的工具循环最多几步（默认 6）。"""
 
 SANDBOX_HOLD_ENV = "SUPERBOT_SANDBOX_HOLD_SEC"
 """Worker 在沙箱里**多待**几秒再销毁（默认 0）。
@@ -636,6 +651,8 @@ class SuperBotPlugin(star.Star):
             "thread_key": thread,
             "batch": len(batch),
             "plan": plan,
+            # Worker 干活要用**原始消息**，不能用 Router 提炼的一句话
+            "task": "\n".join(t.text for t in batch[:10]),
         }
         if self._workers is not None:
             assignment_id = await self._workers.submit(
@@ -656,14 +673,19 @@ class SuperBotPlugin(star.Star):
         return []
 
     async def _run_worker(self, ticket: Ticket) -> WorkerResult:
-        """Worker：有沙箱就在沙箱里执行，否则走桩。
+        """Worker：在沙箱里**真干活**（模型 + 工具循环），拿不到沙箱就走桩。
 
-        沙箱路径刻意演示了必须自己做的两件事：**创建**与**销毁**
-        （``finally`` 里 destroy —— 取消时也一样，否则容器继续占配额）。
+        两件必须自己做的事：**创建**与**销毁**（``finally`` 里 destroy ——
+        取消时也一样，否则容器继续占配额）。
         """
         ctx = self._ticket_ctx.get(ticket.id) or {}
 
-        if self._sandbox is None:
+        can_agent = (
+            self._sandbox is not None
+            and build_sandbox_tools is not None
+            and make_synthetic_event is not None
+        )
+        if not can_agent:
             await asyncio.sleep(_worker_delay())
             if ctx.get("plan"):
                 return WorkerResult(text=ctx["plan"], ok=True)
@@ -671,67 +693,94 @@ class SuperBotPlugin(star.Star):
 
         sandbox_id: str | None = None
         try:
-            for attempt in (1, 2):
-                sandbox_id = await self._sandbox.create(ticket_id=ticket.id)
-                self._sandbox_ids.add(sandbox_id)
-                logger.info(
-                    "%s sandbox %s created for ticket %s (attempt %d)",
-                    LOG_TAG,
-                    sandbox_id,
-                    ticket.id[:8],
-                    attempt,
-                )
+            sandbox_id = await self._open_sandbox(ticket)
+            if sandbox_id is None:
+                return WorkerResult(text="沙箱开不出来", ok=False)
 
-                res = await self._sandbox.exec_python(sandbox_id, "print(6*7)")
-                if res.ok:
-                    break
+            tools = build_sandbox_tools(
+                self._sandbox,  # type: ignore[arg-type]
+                sandbox_id,
+                on_call=lambda name, ok, ms: logger.info(
+                    "%s tool %s ok=%s %dms", LOG_TAG, name, ok, ms
+                ),
+            )
 
-                # 「沙箱在创建与执行之间就没了」是真实存在的情况（预热池轮转、
-                # TTL 到期、被 GC）。这种情况下重试同一个 id 没有意义，要重建。
-                gone = "not found" in (res.error or "").lower()
-                logger.warning(
-                    "%s sandbox exec failed (attempt %d, gone=%s): %s",
-                    LOG_TAG,
-                    attempt,
-                    gone,
-                    res.error,
-                )
-                if attempt == 2:
-                    logger.error("%s sandbox exec gave up: %s", LOG_TAG, res.error)
-                    return WorkerResult(text=f"沙箱执行失败: {res.error}", ok=False)
+            task = ctx.get("task") or ctx.get("plan") or ""
+            event = make_synthetic_event(self.context, ctx["umo"], task)
+            provider_id = await self.context.get_current_chat_provider_id(ctx["umo"])
 
-                # 先收拾掉这个不健康的沙箱，再重建
-                self._sandbox_ids.discard(sandbox_id)
-                try:
-                    await self._sandbox.destroy(sandbox_id)
-                except Exception:  # noqa: BLE001
-                    pass
-                sandbox_id = None
-                if not gone:
-                    await asyncio.sleep(1.0)
-
-            out = (res.output or "").strip()
-            await self._sandbox.write_file(sandbox_id, "ticket.txt", ticket.id)
+            resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=task,
+                tools=tools,
+                system_prompt=(
+                    "你是一个在隔离沙箱里干活的助手。"
+                    "需要计算或查看环境时**必须**调用工具，不要凭记忆猜；"
+                    "拿到结果后用一两句话把结论说给人听，不要贴大段代码或日志。"
+                ),
+                max_steps=_agent_max_steps(),
+                tool_call_timeout=120,
+            )
+            text = (getattr(resp, "completion_text", "") or "").strip()
+            logger.info("%s agent done ticket=%s -> %r", LOG_TAG, ticket.id[:8], text[:120])
+            if not text:
+                return WorkerResult(text="（没得出结果）", ok=False)
 
             # 测试用：让沙箱多活一会儿，好让保活循环确实跑几轮
             hold = _sandbox_hold()
             if hold > 0:
                 await asyncio.sleep(hold)
 
-            plan = ctx.get("plan") or ""
-            text = f"{plan}（沙箱 6×7={out}）" if plan else f"SANDBOX-OK:{out}"
             return WorkerResult(text=text, ok=True)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("%s sandbox worker failed: %s", LOG_TAG, exc)
-            return WorkerResult(text=f"沙箱失败: {exc}", ok=False)
+            logger.exception("%s sandbox worker failed: %s", LOG_TAG, exc)
+            return WorkerResult(text=f"沙箱执行失败: {exc}", ok=False)
         finally:
             if sandbox_id is not None:
                 self._sandbox_ids.discard(sandbox_id)
                 try:
-                    await self._sandbox.destroy(sandbox_id)
+                    await self._sandbox.destroy(sandbox_id)  # type: ignore[union-attr]
                     logger.info("%s sandbox %s destroyed", LOG_TAG, sandbox_id)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("%s sandbox destroy failed: %s", LOG_TAG, exc)
+
+    async def _open_sandbox(self, ticket: Ticket) -> str | None:
+        """开一个能用的沙箱，失败重建一次。
+
+        「创建成功但立刻 404」是真实存在的（预热池轮转、TTL 到期、被 GC），
+        这种情况下重试同一个 id 没意义，要换一个新的。
+        """
+        for attempt in (1, 2):
+            sandbox_id = await self._sandbox.create(ticket_id=ticket.id)  # type: ignore[union-attr]
+            self._sandbox_ids.add(sandbox_id)
+            logger.info(
+                "%s sandbox %s created for ticket %s (attempt %d)",
+                LOG_TAG,
+                sandbox_id,
+                ticket.id[:8],
+                attempt,
+            )
+            probe = await self._sandbox.exec_shell(sandbox_id, "echo ready")  # type: ignore[union-attr]
+            if probe.ok:
+                return sandbox_id
+
+            gone = "not found" in (probe.error or "").lower()
+            logger.warning(
+                "%s sandbox probe failed (attempt %d, gone=%s): %s",
+                LOG_TAG,
+                attempt,
+                gone,
+                probe.error,
+            )
+            self._sandbox_ids.discard(sandbox_id)
+            try:
+                await self._sandbox.destroy(sandbox_id)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
+            if not gone:
+                await asyncio.sleep(1.0)
+        return None
 
     async def _on_worker_done(self, assignment: Assignment) -> None:
         """Worker 结束 → 结果交给 Outbox（不直接对用户信道说话）。"""
@@ -957,6 +1006,20 @@ def _keepalive_interval() -> float:
         return max(0.05, float(raw))
     except ValueError:
         return 1200.0
+
+
+def _agent_max_steps() -> int:
+    """Worker 的工具循环最多跑几步（默认 6）。
+
+    6 步够"查一次 → 算一次 → 汇总"这种典型任务；再多就是在烧钱绕圈。
+    """
+    raw = os.environ.get(AGENT_STEPS_ENV)
+    if raw is None:
+        return 6
+    try:
+        return max(1, min(20, int(raw)))
+    except ValueError:
+        return 6
 
 
 def _sandbox_hold() -> float:
