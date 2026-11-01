@@ -1,73 +1,85 @@
 {
   "gate": {
     "type": "object",
-    "description": "准入规则（Gate）—— 纯程序判定，不消耗模型",
+    "description": "准入规则",
     "items": {
       "bot_ids": {
         "type": "list",
-        "description": "额外要当成“自己”的身份。用于防回环：机器人自己发出的消息会被丢弃",
+        "description": "自身身份",
+        "hint": "额外当成“自己”的身份，用来丢弃机器人自己发的消息（防回环）。默认 [astrbot]",
         "default": ["astrbot"]
       },
       "wake_prefixes": {
         "type": "list",
-        "description": "唤醒前缀。以此开头的消息视为指令，直接交给 AstrBot 原生流程",
+        "description": "唤醒前缀",
+        "hint": "以此开头的消息视为指令，直接交给 AstrBot 原生流程。默认 [/]",
         "default": ["/"]
       },
       "command_names": {
         "type": "list",
-        "description": "无前缀也算指令的首词（可选，一般留空）",
+        "description": "免前缀指令",
+        "hint": "不用前缀也算指令的首词，一般留空",
         "default": []
       },
       "allowed_sources": {
         "type": "list",
-        "description": "允许的来源白名单，格式 平台:群号（如 aiocqhttp:123456）。留空＝全部放行",
+        "description": "来源白名单",
+        "hint": "允许的来源，格式 平台:群号（如 aiocqhttp:123456）。留空＝全部放行",
         "default": []
       },
       "rate_limit": {
         "type": "int",
-        "description": "同一来源在窗口内最多放行多少条，超过直接丢弃",
+        "description": "限流上限",
+        "hint": "同一来源在窗口内最多放行几条，超出直接丢弃。默认 30",
         "default": 30
       },
       "rate_window_sec": {
         "type": "float",
-        "description": "限流窗口长度（秒）",
+        "description": "限流窗口",
+        "hint": "限流窗口长度，单位秒。默认 60",
         "default": 60.0
       }
     }
   },
   "agent": {
     "type": "object",
-    "description": "任务执行（Router / Worker）—— 默认全关，不会碰模型也不会开容器",
+    "description": "任务执行",
     "items": {
       "eval_mode": {
         "type": "string",
-        "description": "ignore＝只判定不回话；echo＝确定性回显（调试）；live＝用真模型判断怎么回",
+        "description": "评估模式",
+        "hint": "ignore 只判定不回话 / echo 确定性回显（调试）/ live 用真模型判断。默认 ignore",
         "options": ["ignore", "echo", "live"],
         "default": "ignore"
       },
       "sandbox": {
         "type": "bool",
-        "description": "开启后 Worker 在 Shipyard Neo 沙箱里真干活（需要下面的 Bay 地址与密钥）",
+        "description": "沙箱执行",
+        "hint": "开启后 Worker 在 Shipyard Neo 沙箱里真干活（需要下面的地址与密钥）。默认关",
         "default": false
       },
       "agent_steps": {
         "type": "int",
-        "description": "Worker 的工具循环最多几步（越多越贵）",
+        "description": "循环步数",
+        "hint": "Worker 的工具循环最多几步，越多越贵。默认 6",
         "default": 6
       },
       "bay_endpoint": {
         "type": "string",
-        "description": "Shipyard Neo（Bay）的地址",
+        "description": "沙箱地址",
+        "hint": "Shipyard Neo（Bay）的地址，如 http://192.168.1.15:8114",
         "default": "http://localhost:8114"
       },
       "bay_api_key": {
         "type": "string",
-        "description": "Bay 的 API key（sk-bay-…）。留空则读环境变量 BAY_API_KEY 或 .runtime/bay_key.txt",
+        "description": "沙箱密钥",
+        "hint": "Bay 的 API key。留空则读环境变量 BAY_API_KEY 或 .runtime/bay_key.txt",
         "default": ""
       },
       "keepalive_sec": {
         "type": "float",
-        "description": "沙箱保活间隔（秒）。必须小于 Bay 的 TTL，否则工作区会被级联删除",
+        "description": "保活间隔",
+        "hint": "沙箱保活间隔，单位秒。必须小于 Bay 的 TTL，否则工作区会被级联删除。默认 1200",
         "default": 1200.0
       }
     }

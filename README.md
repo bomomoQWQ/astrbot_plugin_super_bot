@@ -81,6 +81,34 @@ httpx>=0.27
 | `BAY_API_KEY` | 空 | Bay 的 API key |
 | `SUPERBOT_KEEPALIVE_SEC` | `1200` | 沙箱保活间隔（**必须**小于 TTL，否则工作区会被级联删除） |
 
+### 配置项参考
+
+Dashboard 表单里用的是**中文短名**，配置文件里用的是英文键名，对照表如下。
+
+**`gate`（准入规则，纯程序判定，不消耗模型）**
+
+| 配置键 | 界面名称 | 类型 | 默认 | 说明 |
+|---|---|---|---|---|
+| `bot_ids` | 自身身份 | list | `["astrbot"]` | 额外当成“自己”的身份，用来丢弃机器人自己发的消息（防回环） |
+| `wake_prefixes` | 唤醒前缀 | list | `["/"]` | 以此开头的消息视为指令，直接交给 AstrBot 原生流程 |
+| `command_names` | 免前缀指令 | list | `[]` | 不用前缀也算指令的首词，一般留空 |
+| `allowed_sources` | 来源白名单 | list | `[]` | 允许的来源，格式 `平台:群号`（如 `aiocqhttp:123456`）；留空＝全部放行 |
+| `rate_limit` | 限流上限 | int | `30` | 同一来源在窗口内最多放行几条，超出直接丢弃 |
+| `rate_window_sec` | 限流窗口 | float | `60` | 限流窗口长度（秒） |
+
+**`agent`（任务执行）**
+
+| 配置键 | 界面名称 | 类型 | 默认 | 说明 |
+|---|---|---|---|---|
+| `eval_mode` | 评估模式 | string | `ignore` | `ignore` 只判定不回话 / `echo` 确定性回显（调试）/ `live` 用真模型判断怎么回 |
+| `sandbox` | 沙箱执行 | bool | `false` | 开启后 Worker 在 Shipyard Neo 沙箱里真干活 |
+| `agent_steps` | 循环步数 | int | `6` | Worker 的工具循环最多几步，越多越贵 |
+| `bay_endpoint` | 沙箱地址 | string | `http://localhost:8114` | Shipyard Neo（Bay）的地址 |
+| `bay_api_key` | 沙箱密钥 | string | 空 | Bay 的 API key；留空则读环境变量 `BAY_API_KEY` 或 `.runtime/bay_key.txt` |
+| `keepalive_sec` | 保活间隔 | float | `1200` | 沙箱保活间隔（秒），**必须**小于 Bay 的 TTL |
+
+> 环境变量与配置项是同一套开关，优先级：**环境变量 > Dashboard 配置 > 默认值**。
+
 ---
 
 ## 兼容性
