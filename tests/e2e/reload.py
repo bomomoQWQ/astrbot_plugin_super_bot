@@ -29,11 +29,11 @@ import traceback
 import aiohttp
 
 from tests.e2e.fake_onebot import FakeOneBot
-from tests.e2e.harness import AstrBotInstance
+from tests.e2e.harness import AstrBotInstance, DASHBOARD_PORT
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
-DASH = "http://127.0.0.1:6185"
+DASH = f"http://127.0.0.1:{DASHBOARD_PORT}"
 PLUGIN_ID = "astrbot_plugin_super_bot"
 
 

@@ -9,7 +9,7 @@
 
 启动::
 
-    python -m tests.e2e.fake_llm --port 8180
+    python -m tests.e2e.fake_llm --port 18180
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class FakeLLM:
     """记录所有请求，便于测试断言"模型被调用了 / 没被调用"。"""
 
     host: str = "127.0.0.1"
-    port: int = 8180
+    port: int = 18180
     requests: list[dict] = field(default_factory=list)
     _runner: web.AppRunner | None = None
 
@@ -215,7 +215,7 @@ def build_app(state: FakeLLM) -> web.Application:
 async def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8180)
+    parser.add_argument("--port", type=int, default=18180)
     args = parser.parse_args()
 
     llm = FakeLLM(host=args.host, port=args.port)

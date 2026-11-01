@@ -74,11 +74,15 @@ def astrbot_src() -> Path:
 # 配置
 # ---------------------------------------------------------------------------
 
-FAKE_LLM_PORT = 8180
-ONEBOT_PORT = 6199
-DASHBOARD_PORT = 6185
-"""AstrBot 的 WebUI 端口。**必须**也检查有没有被占——不检查的话，上一轮 e2e
-泄漏的进程会让你以为"配置没生效"，实际是新实例启动到一半就退出去了。"""
+FAKE_LLM_PORT = 18180
+ONEBOT_PORT = 16199
+DASHBOARD_PORT = 16185
+"""测试实例用的端口**故意避开 AstrBot 的默认值**（8180/6199/6185）。
+
+为什么：默认端口是"真实例"会用的。测试如果也占默认端口，那么这台机器上
+一旦跑着真实服务，测试就会和它抢端口——轻则测试失败、重则把真实例顶掉。
+错开之后两者可以共存，也顺便让"端口被占"这个报错只可能来自我们自己的残留进程。
+"""
 
 
 def build_config(
@@ -134,6 +138,12 @@ def build_config(
         "admins_id": admins if admins is not None else ["20001"],
         "plugin_set": ["*"],
         "platform_settings": {"unique_session": unique_session},
+        # 测试实例的 Dashboard 也换非默认端口，避免和真实例抢 6185
+        "dashboard": {
+            "enable": True,
+            "host": "127.0.0.1",
+            "port": DASHBOARD_PORT,
+        },
     }
     if extra:
         cfg.update(extra)

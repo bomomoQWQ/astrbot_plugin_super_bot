@@ -12,7 +12,7 @@ aiocqhttp_platform_adapter.py:55` 用 ``CQHttp(use_ws_reverse=True)``，:435 起
 
 启动一个独立进程::
 
-    python -m tests.e2e.fake_onebot --port 6199 --group 10001
+    python -m tests.e2e.fake_onebot --port 16199 --group 10001
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class FakeOneBot:
     """模拟一个 OneBot v11 协议端。"""
 
     host: str = "127.0.0.1"
-    port: int = 6199
+    port: int = 16199
     path: str = "/ws"
     token: str = ""
     group_id: int = 10001
@@ -331,7 +331,7 @@ class FakeOneBot:
 async def _main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=6199)
+    parser.add_argument("--port", type=int, default=16199)
     parser.add_argument("--path", default="/ws")
     parser.add_argument("--token", default="")
     parser.add_argument("--group", type=int, default=10001)
