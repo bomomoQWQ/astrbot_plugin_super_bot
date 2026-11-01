@@ -189,3 +189,99 @@ async def test_terminate_unregisters_stop_hooks(plugin, plugin_mod):
         e for e in registry._events.get(umo, set()) if e in plugin._stop_events.values()
     ]
     assert leftover == []
+
+
+# ---------------------------------------------------------------------------
+# 沙箱保活
+# ---------------------------------------------------------------------------
+
+
+class FakeSandboxPort:
+    """只实现 keepalive 的假端口。"""
+
+    def __init__(self) -> None:
+        self.kept: list[str] = []
+        self.fail_for: set[str] = set()
+
+    async def keepalive(self, sandbox_id: str) -> None:
+        if sandbox_id in self.fail_for:
+            raise RuntimeError("boom")
+        self.kept.append(sandbox_id)
+
+
+async def test_keepalive_task_starts_when_sandbox_enabled(
+    plugin, monkeypatch
+):
+    """开了沙箱就必须起保活循环 —— 否则 TTL 到期工作区会被级联删除。"""
+    monkeypatch.setenv("SUPERBOT_SANDBOX", "1")
+    monkeypatch.setenv("BAY_API_KEY", "sk-bay-test")
+    await plugin.initialize()
+    try:
+        assert plugin._sandbox is not None
+        assert plugin._keepalive_task is not None, "没有起保活任务"
+        assert plugin._keepalive_task.get_name() == "superbot-keepalive"
+        assert not plugin._keepalive_task.done()
+    finally:
+        await plugin.terminate()
+
+    assert plugin._keepalive_task is None
+    assert _superbot_tasks() == []
+
+
+async def test_keepalive_task_not_started_without_sandbox(plugin):
+    await plugin.initialize()
+    try:
+        assert plugin._sandbox is None
+        assert plugin._keepalive_task is None, "没沙箱不该起保活任务"
+    finally:
+        await plugin.terminate()
+
+
+async def test_keepalive_really_calls_the_port(plugin, monkeypatch):
+    """保活循环必须真的按间隔去调 keepalive。"""
+    monkeypatch.setenv("SUPERBOT_KEEPALIVE_SEC", "0.05")
+    await plugin.initialize()
+    fake = FakeSandboxPort()
+    try:
+        plugin._sandbox = fake  # type: ignore[assignment]
+        plugin._sandbox_ids.add("sb-1")
+        plugin._start_keepalive()
+
+        await asyncio.sleep(0.3)
+
+        assert len(fake.kept) >= 2, f"应该被保活多次，实际 {fake.kept}"
+        assert set(fake.kept) == {"sb-1"}
+    finally:
+        await plugin.terminate()
+
+    assert _superbot_tasks() == []
+
+
+async def test_keepalive_survives_failing_sandbox(plugin, monkeypatch):
+    """一个沙箱保活失败不能拖垮循环，也不能影响别的沙箱。"""
+    monkeypatch.setenv("SUPERBOT_KEEPALIVE_SEC", "0.05")
+    await plugin.initialize()
+    fake = FakeSandboxPort()
+    fake.fail_for = {"bad"}
+    try:
+        plugin._sandbox = fake  # type: ignore[assignment]
+        plugin._sandbox_ids.update({"bad", "good"})
+        plugin._start_keepalive()
+
+        await asyncio.sleep(0.3)
+        assert "good" in fake.kept, "好沙箱应该照常保活"
+    finally:
+        await plugin.terminate()
+
+
+async def test_no_sandbox_ids_means_no_calls(plugin, monkeypatch):
+    monkeypatch.setenv("SUPERBOT_KEEPALIVE_SEC", "0.05")
+    await plugin.initialize()
+    fake = FakeSandboxPort()
+    try:
+        plugin._sandbox = fake  # type: ignore[assignment]
+        plugin._start_keepalive()
+        await asyncio.sleep(0.2)
+        assert fake.kept == [], "没有活跃沙箱时不该发请求"
+    finally:
+        await plugin.terminate()

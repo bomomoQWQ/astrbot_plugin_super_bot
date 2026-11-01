@@ -55,7 +55,7 @@ from superbot.gate import (  # noqa: E402
 )
 from superbot.outbox import Outbox  # noqa: E402
 from superbot.router import Reply, Router, Trigger  # noqa: E402
-from superbot.sandbox import BaySandbox, SandboxPort  # noqa: E402
+from superbot.sandbox import BaySandbox, SandboxPort, keepalive_loop  # noqa: E402
 from superbot.store import DispositionRow, Store  # noqa: E402
 from superbot.synthetic import make_synthetic_event  # noqa: E402
 from superbot.thread_key import thread_key, ticket_id_from_eval, trigger_id  # noqa: E402
@@ -92,6 +92,13 @@ SANDBOX_ENV = "SUPERBOT_SANDBOX"
 
 BAY_ENDPOINT_ENV = "BAY_ENDPOINT"
 BAY_KEY_ENV = "BAY_API_KEY"
+
+KEEPALIVE_ENV = "SUPERBOT_KEEPALIVE_SEC"
+"""沙箱保活间隔（秒），默认 1200。
+
+为什么必须自己续：AstrBot 全仓库**从不**调用 keepalive / extend_ttl，
+而 Bay 的默认 TTL 是 3600s，到期后 managed Cargo 会被级联删除——工作区直接没了。
+"""
 
 EVAL_DELAY_ENV = "SUPERBOT_EVAL_DELAY"
 """桩评估器的假延迟（秒）。真实模型本来就有 1~3 秒延迟，批处理窗口就是它。"""
@@ -225,6 +232,7 @@ class SuperBotPlugin(star.Star):
         self._stop_events: dict[str, Any] = {}
         self._umo_tickets: dict[str, set[str]] = {}
         self._assignment_ids: dict[str, str] = {}
+        self._keepalive_task: asyncio.Task | None = None
         self._stop: asyncio.Event | None = None
         self._router_task: asyncio.Task | None = None
         self._ticket_ctx: dict[str, dict[str, Any]] = {}
@@ -264,7 +272,6 @@ class SuperBotPlugin(star.Star):
                     "%s SUPERBOT_SANDBOX=1 但找不到 BAY_API_KEY，Worker 退回桩执行",
                     LOG_TAG,
                 )
-
         # 批处理调度：单槽 + 只追加，不用定时器
         self._router = Router(evaluate=self._evaluate)
         self._stop = asyncio.Event()
@@ -272,6 +279,8 @@ class SuperBotPlugin(star.Star):
             self._router.run_forever(self._stop),
             name="superbot-router",
         )
+        # 沙箱保活：AstrBot 自己从不续 TTL，到期工作区会被级联删除
+        self._start_keepalive()
 
         self._started_at = time.time()
         logger.info(
@@ -288,8 +297,7 @@ class SuperBotPlugin(star.Star):
 
     async def terminate(self) -> None:
         # 顺序很重要：先停循环，再排空队列，最后 flush + 关库。
-        if self._stop is not None:
-            self._stop.set()
+        if self._stop is not None:            self._stop.set()
         if self._router_task is not None:
             self._router_task.cancel()
             try:
@@ -297,6 +305,14 @@ class SuperBotPlugin(star.Star):
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._router_task = None
+
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._keepalive_task = None
 
         if self._outbox is not None:
             try:
@@ -360,6 +376,34 @@ class SuperBotPlugin(star.Star):
                 cfg.get("rate_window_sec") or limits.DEFAULT_RATE_WINDOW_SEC
             ),
         )
+
+    # -- 沙箱保活 -----------------------------------------------------------
+
+    def _start_keepalive(self) -> None:
+        """启动保活循环（没有沙箱时什么都不做）。
+
+        AstrBot 全仓库**从不**调用 ``keepalive`` / ``extend_ttl``，而 Bay 的默认
+        TTL 是 3600s；到期后 managed Cargo 会被**级联删除**——工作区直接没了。
+        所以这条循环不是优化，是正确性的一部分。
+        """
+        if self._sandbox is None or self._stop is None:
+            return
+        if self._keepalive_task is not None:
+            return
+        interval = _keepalive_interval()
+        self._keepalive_task = asyncio.create_task(
+            keepalive_loop(
+                self._sandbox,
+                lambda: list(self._sandbox_ids),
+                interval=interval,
+                stop=self._stop,
+                on_result=lambda ok, fail: logger.info(
+                    "%s keepalive ok=%d fail=%d", LOG_TAG, ok, fail
+                ),
+            ),
+            name="superbot-keepalive",
+        )
+        logger.info("%s keepalive started: every %.0fs", LOG_TAG, interval)
 
     # -- 主处理器 ----------------------------------------------------------
 
@@ -816,6 +860,21 @@ def _worker_delay() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return min(0.3, _eval_delay())
+
+
+def _keepalive_interval() -> float:
+    """保活间隔（秒）。默认 1200（20 分钟），比 1 小时的 TTL 安全。
+
+    下限取 0.05 而不是 1：既挡住 0/负数（会变成忙等），又让测试能用小间隔
+    真的观察到循环在跑。生产上没人会配这个值。
+    """
+    raw = os.environ.get(KEEPALIVE_ENV)
+    if raw is None:
+        return 1200.0
+    try:
+        return max(0.05, float(raw))
+    except ValueError:
+        return 1200.0
 
 
 def _sandbox_enabled() -> bool:

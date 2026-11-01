@@ -324,19 +324,23 @@ P0 三块已落地并通过单测（commit `7418ea8`）。
 - ~~取消链路在真实例里的验证~~ **已完成**（登记进 `ActiveEventRegistry`，`/stop` 天然找到我们）
 - ~~`terminate()` 的真实行为验证~~ **已完成**（`tests/test_plugin_lifecycle.py`，进程内走生命周期）
 - `P4`：Thread 订阅直通（事件绕过 Router 直达 Worker）
-- `keepalive_loop` 尚未挂进插件（沙箱目前靠 `finally: destroy` 收尾；长任务要续 TTL 才需要它）
-- `@star.register` 装饰器已被上游标为 deprecated（`main.py:199` 会报 DeprecationWarning）。
+- ~~`keepalive_loop` 尚未挂进插件~~ **已完成**（`initialize` 起 `superbot-keepalive` 任务，
+  `SUPERBOT_KEEPALIVE_SEC` 可配，默认 1200s；`terminate` 里取消）
+- ~~`store` 旧库迁移未验~~ **已完成**（`tests/test_store_migration.py` 7 条 + 真实库演练
+  `python -m tests.e2e.migrate_real`，164 行历史数据零丢失）
+- `@star.register` 装饰器已被上游标为 deprecated（`main.py:212` 会报 DeprecationWarning）。
   现在仍可用，但上游若移除就要改成纯继承 `Star`（自动识别）。
 
 ### 7.3 当前可跑的全部验证
 
 | 命令 | 覆盖 | 结果 |
 |---|---|---|
-| `python -m pytest` | 153 条单测（gate/thread_key/store/outbox/router/watchdog/worker/sandbox/生命周期） | 全绿 |
+| `python -m pytest` | **165** 条单测（gate/thread_key/store/store迁移/outbox/router/watchdog/worker/sandbox/生命周期） | 全绿 |
 | `python -m pytest -m live` | 2 条真打 Bay 的用例（含两沙箱隔离） | 全绿 |
-| `python -m tests.e2e.smoke` | 原生链路（指令/@/不回环/不进模型） | 8/8 |
+| `python -m tests.e2e.smoke` | 原生链路（指令/@/不回环/不进模型） | 9/9 |
 | `python -m tests.e2e.scenarios` | Gate→Router→Worker→Outbox 全链路（batch=3）+ `/stop` | 22/22 |
 | `python -m tests.e2e.sandbox_smoke` | Bay API 全能力（创建/执行/读写/销毁） | 8/8 |
 | `python -m tests.e2e.live_model` | 真模型回复 | 6/6 |
-| `python -m tests.e2e.live_chain` | **真模型 + 真沙箱** | 9/9 |
+| `python -m tests.e2e.live_chain` | **真模型 + 真沙箱 + 保活** | 11/11 |
 | `python -m tests.e2e.reload` | 插件重载：真实例里跑到 `terminate()` → 重新 `initialize()` | 7/7 |
+| `python -m tests.e2e.migrate_real` | 拿真实 e2e 状态库演练 v0→v1 迁移 | 通过 |

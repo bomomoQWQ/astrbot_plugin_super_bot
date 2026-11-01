@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 
 import httpx
 
@@ -284,6 +284,7 @@ async def keepalive_loop(
     *,
     interval: float = 1200.0,
     stop: asyncio.Event | None = None,
+    on_result: Callable[[int, int], None] | None = None,
 ) -> None:
     """周期性对所有活跃沙箱保活。
 
@@ -295,6 +296,8 @@ async def keepalive_loop(
         ids_provider: 无参可调用对象或普通序列，返回当前活跃的 sandbox id 列表。
         interval: 保活间隔（默认 20 分钟，比 1 小时 TTL 安全）。
         stop: 停止信号。
+        on_result: 每轮结束回调 ``(成功数, 失败数)``。同步调用，方便调用方打日志
+            ——这样本模块仍然不依赖任何 logger。
     """
     while True:
         if stop is not None and stop.is_set():
@@ -303,11 +306,20 @@ async def keepalive_loop(
             ids = ids_provider() if callable(ids_provider) else list(ids_provider)
         except Exception:  # noqa: BLE001
             ids = []
+
+        ok = fail = 0
         for sid in ids:
             try:
                 await sandbox.keepalive(sid)
+                ok += 1
+            except Exception:  # noqa: BLE001
+                fail += 1
+        if ids and on_result is not None:
+            try:
+                on_result(ok, fail)
             except Exception:  # noqa: BLE001
                 pass
+
         if stop is not None:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)

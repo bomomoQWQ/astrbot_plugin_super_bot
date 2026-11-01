@@ -51,6 +51,8 @@ async def run() -> int:
             "SUPERBOT_EVAL_MODE": "live",
             "SUPERBOT_EVAL_DELAY": "0",
             "SUPERBOT_SANDBOX": "1",
+            # 保活间隔调小，好在一次 e2e 里看到它真的发了请求
+            "SUPERBOT_KEEPALIVE_SEC": "0.2",
         },
     )
     bot: FakeOneBot | None = None
@@ -93,6 +95,12 @@ async def run() -> int:
         check("sandbox " in log and "created" in log, "日志里有沙箱创建", env.log_tail(20))
         check("sandbox " in log and "destroyed" in log, "日志里有沙箱销毁（不留资源）", env.log_tail(20))
         check("live eval ->" in log, "日志里有真模型的评估结果", env.log_tail(20))
+        check("keepalive started" in log, "保活循环已启动（TTL 到期前会自己续）", env.log_tail(20))
+        check(
+            "keepalive ok=" in log,
+            "保活真的发出去了（沙箱活着的时候被续过）",
+            env.log_tail(25),
+        )
 
     except Exception:
         failures += 1
