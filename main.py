@@ -64,6 +64,7 @@ if __package__:
         keepalive_loop,
     )
     from .superbot.store import DispositionRow, Store, TicketRow, TriggerRow  # noqa: F401
+    from .superbot.skills import Skills  # noqa: F401
     from .superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
@@ -97,6 +98,7 @@ else:
         keepalive_loop,
     )
     from superbot.store import DispositionRow, Store, TicketRow, TriggerRow  # noqa: F401
+    from superbot.skills import Skills  # noqa: F401
     from superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
@@ -342,6 +344,7 @@ class SuperBotPlugin(star.Star):
         self._outbox: Outbox | None = None
         self._workers: WorkerPool | None = None
         self._sandbox: SandboxPort | None = None
+        self._skills: Skills | None = None
         self._sandbox_ids: set[str] = set()
         # 停止钩子：umo -> 合成事件；umo -> 该会话在跑的 ticket；ticket -> assignment
         self._stop_events: dict[str, Any] = {}
@@ -366,6 +369,23 @@ class SuperBotPlugin(star.Star):
 
         self._store = Store(data_dir / limits.DB_FILENAME)
         await self._store.open()
+
+        # 技能：框架只把清单注入**主 agent**，Worker 那边一行都没有；
+        # 这里自己扫一遍，两边都用同一份（见 superbot/skills.py 开头的说明）
+        self._skills = Skills(
+            _skill_roots(data_dir),
+            config_path=data_dir.parent.parent / "skills.json",
+        )
+        self._skills.load()
+        if self._skills.list():
+            logger.info(
+                "%s skills loaded: %d (%s)",
+                LOG_TAG,
+                len(self._skills.list()),
+                ", ".join(s.name for s in self._skills.list()[:6]),
+            )
+        for problem in self._skills.problems:
+            logger.warning("%s skill 有问题: %s", LOG_TAG, problem)
 
         self._gate_conf = self._build_gate_conf()
         self._limiter = RateLimiter(
@@ -742,6 +762,30 @@ class SuperBotPlugin(star.Star):
             return "派活失败，看一下日志。"
         return f"收到，去办了（工单 {ticket_id[:8]}）。干完我发给你。"
 
+    def _worker_system_prompt(self) -> str:
+        """Worker 的 system prompt：干活的规矩 + 可用技能清单。
+
+        主 agent 那边由框架注入技能清单（``astr_main_agent.py:592``），
+        但 Worker 是我们自己开的一次 ``tool_loop_agent``，框架管不到——
+        不补这段，子代理就是个不看说明书的临时工。
+        """
+        base = (
+            "你是一个在隔离沙箱里干活的助手。"
+            "需要计算或查看环境时**必须**调用工具，不要凭记忆猜；"
+            "拿到结果后用一两句话把结论说给人听，不要贴大段代码或日志。"
+        )
+        if self._skills is None:
+            return base
+        index = self._skills.index_text()
+        if not index:
+            return base
+        return (
+            f"{base}\n\n"
+            "如果某件事正好有对应的技能，先 `read_skill` 读它的完整说明，"
+            "照着做，别自己发明流程。\n\n"
+            f"{index}"
+        )
+
     # -- 给原生 agent 的路由工具 --------------------------------------------
 
     @filter.llm_tool(name="superbot_dispatch")
@@ -789,6 +833,45 @@ class SuperBotPlugin(star.Star):
         if done.outcome is Outcome.CANCELLED:
             return "任务被取消了。"
         return done.text or "（执行完了，但没有输出）"
+
+    @filter.llm_tool(name="read_skill")
+    async def read_skill(self, event: AstrMessageEvent, name: str, file: str = "") -> str:
+        """读某个技能的完整说明（SKILL.md），或技能目录里的某个文件。
+
+        技能就是一份"怎么干某类事"的操作手册。当用户提到某个技能、或者当前任务
+        明显匹配某个技能的说明时，**先调用它把正文读完再动手**，不要凭印象编流程。
+
+        文件在宿主上，读它**不需要**开沙箱，也不要为了读技能先去跑 shell。
+
+        Args:
+            name(string): 技能名（清单里列出的那个）
+            file(string): 技能目录里的相对路径，如 scripts/run.py；留空＝读 SKILL.md
+        """
+        if self._skills is None:
+            return "技能库没加载。"
+        return self._skills.read(name, file or None)
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
+        """给主 agent 说清楚：读技能有比开沙箱更快的路。
+
+        框架的技能提示词要求模型用 shell 读 ``SKILL.md``
+        （``skill_manager.py:269-273``），而 ``computer_use_runtime=sandbox`` 时
+        那等于先起一个沙箱。这里把更省事的路径讲明白。
+        """
+        if self._skills is None or not self._skills.list():
+            return
+        try:
+            prompt = req.system_prompt or ""
+            if "[技能读取]" in prompt:
+                return
+            req.system_prompt = prompt + (
+                "\n[技能读取]\n"
+                "需要看某个技能的 SKILL.md 时，**优先调用 `read_skill` 工具**"
+                "（直接返回正文，不用开沙箱）；只有要跑技能里的脚本时，才在沙箱里操作。\n"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s on_llm_request failed: %s", LOG_TAG, exc)
 
     async def _dispatch_task(
         self, task: str, *, umo: str, thread: str, deliver: str = "outbox"
@@ -856,6 +939,10 @@ class SuperBotPlugin(star.Star):
                 )
             except Exception:  # noqa: BLE001
                 lines.append("　库：查询失败")
+        if self._skills is not None:
+            n = len(self._skills.list())
+            extra = f"，{len(self._skills.problems)} 个有问题" if self._skills.problems else ""
+            lines.append(f"　技能：{n} 个可用{extra}")
         return "\n".join(lines)
 
     # -- 事实与回话的小工具 -------------------------------------------------
@@ -1165,6 +1252,7 @@ class SuperBotPlugin(star.Star):
                 self._sandbox,  # type: ignore[arg-type]
                 sandbox_id,
                 on_call=self._on_tool_call(ticket.id),
+                skill_reader=self._skills.read if self._skills is not None else None,
             )
 
             task = ctx.get("task") or ctx.get("plan") or ""
@@ -1176,11 +1264,7 @@ class SuperBotPlugin(star.Star):
                 chat_provider_id=provider_id,
                 prompt=task,
                 tools=tools,
-                system_prompt=(
-                    "你是一个在隔离沙箱里干活的助手。"
-                    "需要计算或查看环境时**必须**调用工具，不要凭记忆猜；"
-                    "拿到结果后用一两句话把结论说给人听，不要贴大段代码或日志。"
-                ),
+                system_prompt=self._worker_system_prompt(),
                 max_steps=_agent_max_steps(),
                 tool_call_timeout=120,
             )
@@ -1617,6 +1701,38 @@ def _housekeeping_interval() -> float:
         return max(0.05, float(raw))
     except ValueError:
         return limits.HOUSEKEEPING_INTERVAL_SEC
+
+
+def _skill_roots(data_dir: Path) -> list[Path]:
+    """技能目录：全局 ``data/skills`` + 各插件自带的 ``skills/`` + 框架内置的。
+
+    内置那批（documents / pdf / spreadsheets / skill-creator）在
+    ``astrbot/builtin_stars/<插件>/skills``，不在 data 下——不单独加进来，
+    Worker 就永远看不到这几本"通用手艺手册"。
+    """
+    data_root = data_dir.parent.parent
+    roots = [data_root / "skills"]
+
+    def _collect(parent: Path) -> None:
+        if not parent.is_dir():
+            return
+        try:
+            for plugin_dir in sorted(parent.iterdir()):
+                skills_dir = plugin_dir / "skills"
+                if skills_dir.is_dir():
+                    roots.append(skills_dir)
+        except OSError:
+            pass
+
+    _collect(data_root / "plugins")
+
+    try:
+        import astrbot as _astrbot  # noqa: PLC0415
+
+        _collect(Path(_astrbot.__file__).parent / "builtin_stars")
+    except Exception:  # noqa: BLE001
+        pass
+    return roots
 
 
 def _sandbox_hold() -> float:

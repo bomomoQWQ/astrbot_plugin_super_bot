@@ -50,6 +50,7 @@ def build_sandbox_tools(
     *,
     max_output: int = DEFAULT_MAX_OUTPUT,
     on_call: Callable[[str, bool, int], None] | None = None,
+    skill_reader: Callable[[str, str | None], str] | None = None,
 ) -> ToolSet:
     """给某个沙箱造一组工具。
 
@@ -59,6 +60,8 @@ def build_sandbox_tools(
         max_output: 单次输出上限。
         on_call: ``(工具名, 是否成功, 耗时ms)`` 的回调，方便调用方打日志
             ——本模块不依赖任何 logger。
+        skill_reader: ``(技能名, 文件名或None) -> 正文``。给了就多挂一把
+            ``read_skill``：技能文件在**宿主**上，不必传进沙箱也能读。
     """
 
     def _report(name: str, ok: bool, started: float) -> None:
@@ -169,4 +172,39 @@ def build_sandbox_tools(
             handler=read_file,
         )
     )
+    if skill_reader is not None:
+
+        async def read_skill(event: Any, name: str, file: str | None = None) -> str:
+            """读技能的完整说明。"""
+            t0 = time.perf_counter()
+            try:
+                text = skill_reader(name, file)
+                ok = True
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                text = f"读技能失败：{exc}"
+            _report("read_skill", ok, t0)
+            return _clip(text, max_output) or "（技能是空的）"
+
+        tools.add_tool(
+            FunctionTool(
+                name="read_skill",
+                description=(
+                    "读某个技能的完整说明（SKILL.md），可以直接取技能目录里的其它文件。"
+                    "技能文件在宿主上，读它不需要动沙箱。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "技能名"},
+                        "file": {
+                            "type": "string",
+                            "description": "技能目录里的相对路径（可选，默认读 SKILL.md）",
+                        },
+                    },
+                    "required": ["name"],
+                },
+                handler=read_skill,
+            )
+        )
     return tools

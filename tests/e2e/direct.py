@@ -20,7 +20,7 @@ import traceback
 
 from tests.e2e.fake_llm import FakeLLM
 from tests.e2e.fake_onebot import FakeOneBot
-from tests.e2e.harness import AstrBotInstance
+from tests.e2e.harness import RUNTIME_DIR, AstrBotInstance
 
 PASS = "[PASS]"
 FAIL = "[FAIL]"
@@ -46,9 +46,23 @@ async def run() -> int:
     )
     llm = FakeLLM()
     await llm.start()  # 模型工具那条链要用它
+
+    # 先放一个技能进去，看插件启动时能不能扫到
+    skill_dir = RUNTIME_DIR / "data" / "skills" / "demo-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: demo-skill\ndescription: 演示技能，e2e 用的\n---\n\n照着做。\n",
+        encoding="utf-8",
+    )
+
     bot: FakeOneBot | None = None
     try:
         await env.start()
+        check(
+            await env.wait_log("skills loaded", timeout=20),
+            "启动时扫到了技能",
+            env.log_tail(20),
+        )
         check(
             await env.wait_log("[super-bot] initialized", timeout=20),
             "插件就绪（eval_mode=echo）",
@@ -62,6 +76,11 @@ async def run() -> int:
         await bot.send_group("/sb", user_id=20002)
         status = await bot.wait_for_text("Super Bot 状态", timeout=20)
         check(status is not None, "/sb 报状态", env.log_tail(20))
+        check(
+            status is not None and "技能：" in status,
+            "状态里有技能计数",
+            str(status),
+        )
 
         bot.reset()
         await bot.send_group("/sb status", user_id=20002)

@@ -60,6 +60,31 @@ AstrBot 默认的链路是"一条消息 → 一次模型调用 → 一次回复"
 
 命令全部收在 `/sb` 下面，不往全局命令空间里扔裸命令。
 
+### 技能（SKILL.md）
+
+AstrBot 自带技能系统：`data/skills/<名字>/SKILL.md`，或插件自带的
+`data/plugins/<插件>/skills/<名字>/SKILL.md`，用 `data/skills.json` 的
+`{"active": false}` 关掉。这套目录约定**原样沿用**，不另造一套。
+
+本插件补了两个缺口：
+
+| 缺口 | 补法 |
+|---|---|
+| 框架只把技能清单注入**主 agent**，Worker 一行都没有 | 把同一份清单追加到 Worker 的 system prompt |
+| 框架让模型**用 shell 读** `SKILL.md`，`runtime=sandbox` 时等于先开一个沙箱 | 注册 `read_skill` 工具，直接从宿主读正文返回；技能目录里的 `scripts/`、`assets/` 也能按需取 |
+
+```markdown
+---
+name: my-skill
+description: 一句话说清"这技能干什么、什么时候该用"
+---
+
+# 正文：具体怎么做
+```
+
+启动时会扫一遍：名字不合法、缺 `description`、`SKILL.md` 读不了，都会打 WARN；
+`/sb` 里能看到当前有几个技能可用。
+
 ---
 
 ## 安装

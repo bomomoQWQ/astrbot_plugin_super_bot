@@ -636,3 +636,52 @@ async def test_dispatch_tool_mode_stays_silent(plugin):
         assert await plugin._store.ticket_state(tid) == "done"
     finally:
         await plugin.terminate()
+
+
+# ---------------------------------------------------------------------------
+# 技能注入
+# ---------------------------------------------------------------------------
+
+
+def _make_skill(tmp_path, name: str = "demo", desc: str = "做演示") -> None:
+    d = tmp_path / "data" / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {desc}\n---\n\n照这个做。\n",
+        encoding="utf-8",
+    )
+
+
+async def test_initialize_loads_skills(plugin, tmp_path):
+    _make_skill(tmp_path)
+    await plugin.initialize()
+    try:
+        assert plugin._skills is not None
+        names = [s.name for s in plugin._skills.list()]
+        assert "demo" in names, f"没扫到自己放的技能：{names}"
+        status = await plugin._status_text()
+        assert "技能：" in status
+    finally:
+        await plugin.terminate()
+
+
+async def test_worker_prompt_gets_skill_index(plugin, tmp_path):
+    """Worker 是插件自己开的一次 agent，框架管不到——必须自己注入清单。"""
+    _make_skill(tmp_path, "demo", "做演示用")
+    await plugin.initialize()
+    try:
+        prompt = plugin._worker_system_prompt()
+        assert "demo: 做演示用" in prompt
+        assert "read_skill" in prompt
+    finally:
+        await plugin.terminate()
+
+
+async def test_read_skill_tool_reads_body(plugin, tmp_path):
+    _make_skill(tmp_path)
+    await plugin.initialize()
+    try:
+        text = await plugin.read_skill(None, "demo", "")
+        assert "照这个做" in text
+    finally:
+        await plugin.terminate()
