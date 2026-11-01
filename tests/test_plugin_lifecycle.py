@@ -20,11 +20,25 @@ from types import SimpleNamespace
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-ASTRBOT_SRC = Path(os.environ.get("ASTRBOT_SRC", r"F:\理解痞老板\AstrBot"))
+
+
+def _find_astrbot_src() -> Path | None:
+    """找 AstrBot 源码：``ASTRBOT_SRC`` 优先，否则试几个常见位置。"""
+    env = os.environ.get("ASTRBOT_SRC")
+    if env:
+        p = Path(env)
+        return p if (p / "astrbot").is_dir() else None
+    for cand in (REPO.parent / "AstrBot", REPO / "AstrBot", Path.home() / "AstrBot"):
+        if (cand / "astrbot").is_dir():
+            return cand
+    return None
+
+
+ASTRBOT_SRC = _find_astrbot_src() or Path("__missing__")
 
 pytestmark = pytest.mark.skipif(
-    not (ASTRBOT_SRC / "astrbot").is_dir(),
-    reason=f"没有 AstrBot 源码：{ASTRBOT_SRC}",
+    ASTRBOT_SRC == Path("__missing__"),
+    reason="没有 AstrBot 源码：设置 ASTRBOT_SRC 指向 AstrBot 仓库根目录",
 )
 
 

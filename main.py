@@ -64,7 +64,6 @@ if __package__:
         keepalive_loop,
     )
     from .superbot.store import DispositionRow, Store  # noqa: F401
-    from .superbot.synthetic import make_synthetic_event  # noqa: F401
     from .superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
@@ -97,7 +96,6 @@ else:
         keepalive_loop,
     )
     from superbot.store import DispositionRow, Store  # noqa: F401
-    from superbot.synthetic import make_synthetic_event  # noqa: F401
     from superbot.thread_key import (  # noqa: F401
         thread_key,
         ticket_id_from_eval,
@@ -110,6 +108,19 @@ else:
         WorkerPool,
         WorkerResult,
     )
+
+# 合成事件是唯一依赖 ``astrbot.core.*`` **私有**模块的地方（照抄 CronMessageEvent）。
+# 上游一旦重构这些路径，不应该让整个插件加载失败——降级即可：
+# 只是 ``live`` 评估器和 /stop 登记用不了，其它功能照常。
+try:
+    if __package__:
+        from .superbot.synthetic import make_synthetic_event
+    else:
+        from superbot.synthetic import make_synthetic_event
+    _SYNTHETIC_ERR: str | None = None
+except Exception as _exc:  # noqa: BLE001
+    make_synthetic_event = None  # type: ignore[assignment]
+    _SYNTHETIC_ERR = f"{type(_exc).__name__}: {_exc}"
 
 # 让框架自带的 /stop 能停到我们：把每个会话的活跃任务登记进 ActiveEventRegistry。
 # 这个模块是 AstrBot 内置命令用的同一个（builtin_stars/builtin_commands/commands/
@@ -583,6 +594,13 @@ class SuperBotPlugin(star.Star):
         """
         if not batch:
             return []
+        if make_synthetic_event is None:
+            logger.error(
+                "%s live 评估器不可用：合成事件模块加载失败（%s）",
+                LOG_TAG,
+                _SYNTHETIC_ERR,
+            )
+            return []
         umo = batch[-1].umo
         thread = batch[-1].thread_key
         digest = "\n".join(f"- {t.actor_id}: {t.text}" for t in batch[:10])
@@ -783,6 +801,9 @@ class SuperBotPlugin(star.Star):
         self._assignment_ids[ticket_id] = assignment_id
 
         if umo in self._stop_events:
+            return
+        if make_synthetic_event is None:
+            # 登记不了就算了：/stop 停不到我们，但不该因此报错刷屏
             return
         try:
             event = make_synthetic_event(self.context, umo, "[super-bot task]")

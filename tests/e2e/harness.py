@@ -2,7 +2,7 @@
 
 约定：
 
-- **AstrBot 源码**：默认 ``F:/理解痞老板/AstrBot``，可用 ``ASTRBOT_SRC`` 覆盖。
+- **AstrBot 源码**：用 ``ASTRBOT_SRC`` 指定，或放在仓库同级目录 ``../AstrBot``。
   只读使用，绝不修改（它的 ``data/`` 指向我们的运行目录）。
 - **运行目录**：仓库下 ``.runtime/``，用 ``ASTRBOT_ROOT`` 环境变量指定，
   于是 ``data/``、``plugin_data/`` 全部落在 ``.runtime/data`` 里，
@@ -46,8 +46,28 @@ PLUGIN_MODULE_NAME = "astrbot_plugin_super_bot"
 
 
 def astrbot_src() -> Path:
-    raw = os.environ.get("ASTRBOT_SRC", r"F:\理解痞老板\AstrBot")
-    return Path(raw).resolve()
+    """AstrBot 源码位置。
+
+    优先 ``ASTRBOT_SRC``；否则在仓库旁边找几个常见位置。**不写死任何人的机器路径**
+    —— 那是本地环境，不该进仓库。
+    """
+    raw = os.environ.get("ASTRBOT_SRC")
+    if raw:
+        return Path(raw).resolve()
+
+    for cand in (
+        REPO_ROOT.parent / "AstrBot",
+        REPO_ROOT / "AstrBot",
+        Path.home() / "AstrBot",
+        Path.home() / "astrbot",
+    ):
+        if (cand / "astrbot").is_dir():
+            return cand.resolve()
+
+    raise RuntimeError(
+        "找不到 AstrBot 源码。请设置环境变量 ASTRBOT_SRC 指向 AstrBot 仓库根目录"
+        "（里面有 astrbot/ 和 main.py）。"
+    )
 
 
 # ---------------------------------------------------------------------------
