@@ -31,8 +31,12 @@ SKILL_NAME_RE = re.compile(r"^[\w.-]+$")
 FRONTMATTER_DESC_RE = re.compile(r"^\s*description\s*:\s*(.+)$", re.MULTILINE)
 FRONTMATTER_NAME_RE = re.compile(r"^\s*name\s*:\s*(.+)$", re.MULTILINE)
 
-MAX_SKILL_BYTES = 64 * 1024
-"""单个技能文件最多读这么多，防止有人塞个几兆的 PDF 进来。"""
+MAX_SKILL_BYTES = 12 * 1024
+"""单个技能文件最多读这么多。
+
+不是省内存，是**省上下文**：工具返回值会整段进模型的 context，
+按中文算 12KB ≈ 4000 字 ≈ 3000 token，再多就把对话挤没了。
+超了截断，并提示模型用 ``file`` 参数只取需要的部分。"""
 
 
 @dataclass(frozen=True)
@@ -256,7 +260,13 @@ class Skills:
         size = target.stat().st_size
         text = target.read_text(encoding="utf-8", errors="replace")
         if len(text.encode("utf-8")) > self.max_bytes:
-            text = text[: self.max_bytes // 4] + "\n\n…（文件太大，已截断）"
+            keep = max(200, self.max_bytes // 3)
+            text = (
+                text[:keep]
+                + "\n\n…（太长，已截断）\n"
+                + "需要后面部分就再调一次：`read_skill(name, file=\"…\")` "
+                + "读具体文件，或者让子代理去跑，别整篇往上下文里塞。"
+            )
         head = f"# 技能 {skill.name} / {target.relative_to(skill.root).as_posix()}（{size} 字节）\n\n"
         body = head + text
         # 只有正文时，顺手把目录里的其它文件报出来，模型才知道有脚本可拿

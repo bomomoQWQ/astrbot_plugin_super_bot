@@ -42,3 +42,11 @@ def test_shipped_skill_states_the_hard_rules():
     text = _load().read("super-bot")
     assert "不许编造" in text, "少了『不许编造结果』这条底线"
     assert "/sb do" in text, "得告诉模型用户还有另一个入口"
+
+
+def test_shipped_skill_names_the_three_work_types():
+    """重活 / 脏活 / 长活 —— 这三类必须点名，否则模型只认"算数"。"""
+    text = _load().read("super-bot")
+    for word in ("重活", "脏活", "长活"):
+        assert word in text, f"没写清楚「{word}」该派"
+    assert "superbot_dispatch" in text

@@ -201,6 +201,12 @@ RETRY_BACKOFF_ENV = "SUPERBOT_RETRY_BACKOFF_SEC"
 TOOL_WAIT_ENV = "SUPERBOT_TOOL_WAIT_SEC"
 """llm_tool 等 Worker 跑完的上限（秒），默认 90。超时不取消任务，改成跑完直接发。"""
 
+TOOL_RESULT_MAX_CHARS = 1200
+"""工具结果回注上下文的上限（字符）。
+
+超了就把全文直接发给用户，只把前 1200 字交给模型——不然一次派活
+就能把上下文塞满，后面的对话全被挤没。"""
+
 HELP_TEXT = """/sb —— Super Bot
 
 /sb              看状态（同 /sb status）
@@ -832,7 +838,25 @@ class SuperBotPlugin(star.Star):
             return f"执行失败：{(done.error or done.text or '未知原因')[:300]}"
         if done.outcome is Outcome.CANCELLED:
             return "任务被取消了。"
-        return done.text or "（执行完了，但没有输出）"
+
+        text = done.text or ""
+        # 结果太长就别整篇塞回上下文：正文直接发给用户，模型只拿摘要
+        if len(text) > TOOL_RESULT_MAX_CHARS:
+            await self._emit(
+                [
+                    Reply(
+                        umo=event.unified_msg_origin,
+                        text=text,
+                        thread_key=thread,
+                    )
+                ]
+            )
+            head = text[:TOOL_RESULT_MAX_CHARS]
+            return (
+                f"{head}\n\n…（结果共 {len(text)} 字，完整版已经直接发给用户了。"
+                "你只需用一两句话点出结论，不要复述全文。）"
+            )
+        return text or "（执行完了，但没有输出）"
 
     @filter.llm_tool(name="read_skill")
     async def read_skill(self, event: AstrMessageEvent, name: str, file: str = "") -> str:
