@@ -51,8 +51,9 @@ async def run() -> int:
             "SUPERBOT_EVAL_MODE": "live",
             "SUPERBOT_EVAL_DELAY": "0",
             "SUPERBOT_SANDBOX": "1",
-            # 保活间隔调小，好在一次 e2e 里看到它真的发了请求
+            # 保活间隔调小，并且让沙箱多活一会儿，好在一次 e2e 里看到它真的发请求
             "SUPERBOT_KEEPALIVE_SEC": "0.2",
+            "SUPERBOT_SANDBOX_HOLD_SEC": "1.0",
         },
     )
     bot: FakeOneBot | None = None

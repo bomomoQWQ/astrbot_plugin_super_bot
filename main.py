@@ -112,6 +112,14 @@ WORKER_DELAY_ENV = "SUPERBOT_WORKER_DELAY"
 测试 ``/stop`` 时要把它调大（比如 30），否则任务结束得太快、来不及取消。
 """
 
+SANDBOX_HOLD_ENV = "SUPERBOT_SANDBOX_HOLD_SEC"
+"""Worker 在沙箱里**多待**几秒再销毁（默认 0）。
+
+只为测试：真实任务本来就会在沙箱里待很久（保活循环自然能跑好几轮），
+而 e2e 里的任务不到 1 秒就结束了，保活可能一个 tick 都没赶上。
+给一个"多待一会儿"的旋钮，就能确定性地观察到保活在发请求。
+"""
+
 __all__ = ["SuperBotPlugin"]
 
 
@@ -639,6 +647,12 @@ class SuperBotPlugin(star.Star):
 
             out = (res.output or "").strip()
             await self._sandbox.write_file(sandbox_id, "ticket.txt", ticket.id)
+
+            # 测试用：让沙箱多活一会儿，好让保活循环确实跑几轮
+            hold = _sandbox_hold()
+            if hold > 0:
+                await asyncio.sleep(hold)
+
             plan = ctx.get("plan") or ""
             text = f"{plan}（沙箱 6×7={out}）" if plan else f"SANDBOX-OK:{out}"
             return WorkerResult(text=text, ok=True)
@@ -875,6 +889,17 @@ def _keepalive_interval() -> float:
         return max(0.05, float(raw))
     except ValueError:
         return 1200.0
+
+
+def _sandbox_hold() -> float:
+    """Worker 在沙箱里多待几秒（默认 0）。只为测试。"""
+    raw = os.environ.get(SANDBOX_HOLD_ENV)
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
 
 
 def _sandbox_enabled() -> bool:
