@@ -1,6 +1,6 @@
 # 架构大调查 · 索引与结论速查
 
-> 调查对象：AstrBot **v4.28.1**（`ab42c0d9b`，2026-09-14，`F:\理解痞老板\AstrBot`）
+> 调查对象：AstrBot **v4.28.1**（`ab42c0d9b`，2026-09-14，`<AstrBot 仓库>`）
 > 参考实现：`deepseek-ai/dsh-superagent-prototype`（MIT）
 > 沙箱候选：`AstrBotDevs/shipyard-neo`（AGPL-3.0）
 > 方法：源码实读 + 官方文档 + 参考实现文档。**每条结论带 `file:line` 证据；推断显式标注。**

@@ -67,7 +67,7 @@
       "bay_endpoint": {
         "type": "string",
         "description": "沙箱地址",
-        "hint": "Shipyard Neo（Bay）的地址，如 http://192.168.1.15:8114",
+        "hint": "Shipyard Neo（Bay）的地址，如 http://127.0.0.1:8114",
         "default": "http://localhost:8114"
       },
       "bay_api_key": {

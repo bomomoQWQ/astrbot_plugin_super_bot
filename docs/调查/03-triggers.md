@@ -1,6 +1,6 @@
 # 03 · 触发器全景与 Pipeline 中断条件调查
 
-- 调查对象：`F:\理解痞老板\AstrBot`（AstrBot v4.28.1，commit `ab42c0d9b`，Python 3.13）
+- 调查对象：`<AstrBot 仓库>`（AstrBot v4.28.1，commit `ab42c0d9b`，Python 3.13）
 - 方式：只读源码，未修改仓库任何文件。
 - 证据格式：`相对路径:行号`（相对 AstrBot 根目录）。标注「推断」的条目无直接代码证据。
 

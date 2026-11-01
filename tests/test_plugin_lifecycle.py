@@ -4,8 +4,8 @@ r"""插件生命周期测试：``initialize()`` / ``terminate()`` 的真实行�
 ``TerminateProcess``（硬杀），插件的 ``terminate()`` 根本不会跑。所以这里
 **在进程内**直接构造插件对象、走一遍生命周期。
 
-前置：能 import 到 AstrBot 源码（默认 ``F:\理解痞老板\AstrBot``，可用
-``ASTRBOT_SRC`` 覆盖）。做不到就跳过。
+前置：能 import 到 AstrBot 源码（用 ``ASTRBOT_SRC`` 指向那份 checkout，
+默认找当前目录下的 ``AstrBot/``）。做不到就跳过。
 """
 
 from __future__ import annotations

@@ -203,4 +203,7 @@ Dashboard 表单里用的是**中文短名**，配置文件里用的是英文键
 
 ## 许可证
 
-<!-- 待定：建议与上游 AstrBot 一致采用 AGPL-3.0，或改用 MIT -->
+[MIT](LICENSE) © bomomoQWQ
+
+`docs/调查/_ref/` 下是从上游镜像过来的参考实现，保留它自己的 MIT 声明，
+版权归原作者（DeepSeek Harness Team），详见该目录里的 `LICENSE`。

@@ -1,7 +1,7 @@
 # 05 · 沙箱 / Shipyard Neo 接入调查
 
-> 调查范围：AstrBot v4.28.1 源码部署（`F:\理解痞老板\AstrBot`）+ AstrBotDevs/shipyard-neo 官方文档。
-> **路径约定**：本文所有 `相对路径:行号` 均相对 AstrBot 仓库根 `F:\理解痞老板\AstrBot`；网页证据用 `URL#小节`。
+> 调查范围：AstrBot v4.28.1 源码部署（`<AstrBot 仓库>`）+ AstrBotDevs/shipyard-neo 官方文档。
+> **路径约定**：本文所有 `相对路径:行号` 均相对 AstrBot 仓库根 `<AstrBot 仓库>`；网页证据用 `URL#小节`。
 > 标注「推断」的段落是基于证据的推理，未经运行验证（本次按要求未启动 Docker、未改仓库）。
 
 ---
