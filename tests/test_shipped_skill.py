@@ -50,3 +50,10 @@ def test_shipped_skill_names_the_three_work_types():
     for word in ("重活", "脏活", "长活"):
         assert word in text, f"没写清楚「{word}」该派"
     assert "superbot_dispatch" in text
+
+
+def test_shipped_skill_warns_sandbox_has_no_network():
+    """沙箱没外网是实测出来的边界；不写进说明书，模型就会一直派联网任务。"""
+    text = _load().read("super-bot")
+    assert "没有外网" in text or "出不了网" in text
+    assert "clone" in text.lower() or "下载" in text
