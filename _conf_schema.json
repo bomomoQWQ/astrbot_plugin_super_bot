@@ -7,13 +7,17 @@
         "type": "list",
         "description": "自身身份",
         "hint": "额外当成“自己”的身份，用来丢弃机器人自己发的消息（防回环）。默认 [astrbot]",
-        "default": ["astrbot"]
+        "default": [
+          "astrbot"
+        ]
       },
       "wake_prefixes": {
         "type": "list",
         "description": "唤醒前缀",
         "hint": "以此开头的消息视为指令，直接交给 AstrBot 原生流程。默认 [/]",
-        "default": ["/"]
+        "default": [
+          "/"
+        ]
       },
       "command_names": {
         "type": "list",
@@ -49,7 +53,11 @@
         "type": "string",
         "description": "评估模式",
         "hint": "ignore 只判定不回话 / echo 确定性回显（调试）/ live 用真模型判断。默认 ignore",
-        "options": ["ignore", "echo", "live"],
+        "options": [
+          "ignore",
+          "echo",
+          "live"
+        ],
         "default": "ignore"
       },
       "sandbox": {
@@ -57,6 +65,12 @@
         "description": "沙箱执行",
         "hint": "开启后 Worker 在 Shipyard Neo 沙箱里真干活（需要下面的地址与密钥）。默认关",
         "default": false
+      },
+      "sandbox_proxy": {
+        "type": "string",
+        "description": "沙箱代理",
+        "hint": "沙箱里跑命令时用的出口代理，如 http://192.168.1.254:5078。留空＝直连",
+        "default": ""
       },
       "agent_steps": {
         "type": "int",

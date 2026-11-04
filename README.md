@@ -129,6 +129,7 @@ httpx>=0.27
 |---|---|---|
 | `SUPERBOT_EVAL_MODE` | `ignore` | `ignore` 只判定不回话 / `echo` 确定性回显（调试用）/ `live` 走真模型 |
 | `SUPERBOT_SANDBOX` | 关 | `1` = Worker 在 Shipyard Neo 沙箱里真干活 |
+| `SUPERBOT_SANDBOX_PROXY` | 空 | 沙箱出口代理，如 `http://192.168.1.254:5078`；留空＝直连 |
 | `SUPERBOT_AGENT_STEPS` | `6` | Worker 的工具循环上限（步数越多越贵） |
 | `BAY_ENDPOINT` | `http://localhost:8114` | Bay 地址 |
 | `BAY_API_KEY` | 空 | Bay 的 API key |
@@ -155,6 +156,7 @@ Dashboard 表单里用的是**中文短名**，配置文件里用的是英文键
 |---|---|---|---|---|
 | `eval_mode` | 评估模式 | string | `ignore` | `ignore` 只判定不回话 / `echo` 确定性回显（调试）/ `live` 用真模型判断怎么回 |
 | `sandbox` | 沙箱执行 | bool | `false` | 开启后 Worker 在 Shipyard Neo 沙箱里真干活 |
+| `sandbox_proxy` | 沙箱代理 | string | 空 | 沙箱里跑命令时的出口代理，如 `http://192.168.1.254:5078`；留空＝直连 |
 | `agent_steps` | 循环步数 | int | `6` | Worker 的工具循环最多几步，越多越贵 |
 | `bay_endpoint` | 沙箱地址 | string | `http://localhost:8114` | Shipyard Neo（Bay）的地址 |
 | `bay_api_key` | 沙箱密钥 | string | 空 | Bay 的 API key；留空则读环境变量 `BAY_API_KEY` 或 `.runtime/bay_key.txt` |

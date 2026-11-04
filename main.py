@@ -1277,6 +1277,7 @@ class SuperBotPlugin(star.Star):
                 sandbox_id,
                 on_call=self._on_tool_call(ticket.id),
                 skill_reader=self._skills.read if self._skills is not None else None,
+                proxy=_sandbox_proxy() or None,
             )
 
             task = ctx.get("task") or ctx.get("plan") or ""
@@ -1647,6 +1648,21 @@ def _worker_delay() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return min(0.3, _eval_delay())
+
+
+SANDBOX_PROXY_ENV = "SUPERBOT_SANDBOX_PROXY"
+"""沙箱出口代理，形如 ``http://192.168.1.254:5078``。留空＝直连。"""
+
+
+def _sandbox_proxy() -> str:
+    """沙箱里跑命令时用的代理。
+
+    为什么需要：沙箱能上网，但目标站点可能在用户那台机器上被拦住
+    （实测：宿主机 hosts 把 github 指到 127.0.0.1，直连真实 IP 也不通）。
+    配了它，Worker 的每条 shell / python 都自动带上代理环境变量。
+    """
+    raw = os.environ.get(SANDBOX_PROXY_ENV) or _conf_get("agent", "sandbox_proxy")
+    return str(raw or "").strip()
 
 
 def _keepalive_interval() -> float:

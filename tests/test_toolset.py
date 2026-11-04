@@ -186,3 +186,34 @@ async def test_on_call_callback_reports():
     sb.python_result = ("err", "", "boom")
     await _tool(tools, "run_python").handler(None, code="1/0")
     assert seen == [("run_python", True), ("run_python", False)]
+
+
+# ---------------------------------------------------------------------------
+# 沙箱出口代理
+# ---------------------------------------------------------------------------
+
+
+def test_shell_gets_proxy_prefix():
+    from superbot.toolset import _shell_with_proxy
+
+    out = _shell_with_proxy("curl https://github.com", "http://192.168.1.254:5078")
+    assert 'http_proxy="http://192.168.1.254:5078"' in out
+    assert 'https_proxy="http://192.168.1.254:5078"' in out
+    assert out.endswith("curl https://github.com")
+
+
+def test_python_gets_proxy_env():
+    from superbot.toolset import _python_with_proxy
+
+    out = _python_with_proxy("print(1)", "http://192.168.1.254:5078")
+    assert '_os.environ.setdefault("https_proxy"' in out
+    assert out.endswith("print(1)")
+
+
+def test_proxy_quotes_are_stripped():
+    """代理串里混进引号不能把命令拼坏。"""
+    from superbot.toolset import _shell_with_proxy
+
+    out = _shell_with_proxy("echo hi", 'http://a"b:1')
+    assert 'http://ab:1' in out
+    assert out.count('"') == 10  # 5 对

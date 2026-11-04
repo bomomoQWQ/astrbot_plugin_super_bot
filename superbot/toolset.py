@@ -44,6 +44,34 @@ def _fmt(res: ExecResult, limit: int) -> str:
     return f"执行失败：{err}" + (f"\n已有输出：{body}" if body else "")
 
 
+def _shell_with_proxy(command: str, proxy: str) -> str:
+    """在命令前面加上代理环境变量。
+
+    沙箱本身能上网，但目标站点可能在用户那台机器上被拦掉（实测：宿主机 hosts
+    把 github 指到 127.0.0.1，且直连真实 IP 也通不了）。配了 ``proxy`` 就统一
+    从代理出口走，省得模型自己在命令里手写 export。
+    """
+    q = proxy.replace('"', "")
+    return (
+        f'export http_proxy="{q}" https_proxy="{q}" all_proxy="{q}" '
+        f'HTTP_PROXY="{q}" HTTPS_PROXY="{q}"; {command}'
+    )
+
+
+def _python_with_proxy(code: str, proxy: str) -> str:
+    """给要执行的 Python 代码前面塞一段设置环境变量的话。"""
+    q = proxy.replace('"', "")
+    head = (
+        "import os as _os\n"
+        f'_os.environ.setdefault("http_proxy", "{q}")\n'
+        f'_os.environ.setdefault("https_proxy", "{q}")\n'
+        f'_os.environ.setdefault("all_proxy", "{q}")\n'
+        f'_os.environ.setdefault("HTTP_PROXY", "{q}")\n'
+        f'_os.environ.setdefault("HTTPS_PROXY", "{q}")\n'
+    )
+    return head + code
+
+
 def build_sandbox_tools(
     sandbox: SandboxPort,
     sandbox_id: str,
@@ -51,6 +79,7 @@ def build_sandbox_tools(
     max_output: int = DEFAULT_MAX_OUTPUT,
     on_call: Callable[[str, bool, int], None] | None = None,
     skill_reader: Callable[[str, str | None], str] | None = None,
+    proxy: str | None = None,
 ) -> ToolSet:
     """给某个沙箱造一组工具。
 
@@ -62,6 +91,8 @@ def build_sandbox_tools(
             ——本模块不依赖任何 logger。
         skill_reader: ``(技能名, 文件名或None) -> 正文``。给了就多挂一把
             ``read_skill``：技能文件在**宿主**上，不必传进沙箱也能读。
+        proxy: 形如 ``http://192.168.1.254:5078``。给了就让每条 shell / python
+            都带上 ``http_proxy`` 之类的环境变量，从代理出口走。
     """
 
     def _report(name: str, ok: bool, started: float) -> None:
@@ -74,14 +105,16 @@ def build_sandbox_tools(
     async def run_python(event: Any, code: str) -> str:
         """在沙箱里执行 Python 代码。"""
         t0 = time.perf_counter()
-        res = await sandbox.exec_python(sandbox_id, code, timeout=60)
+        payload = _python_with_proxy(code, proxy) if proxy else code
+        res = await sandbox.exec_python(sandbox_id, payload, timeout=60)
         _report("run_python", res.ok, t0)
         return _fmt(res, max_output)
 
     async def run_shell(event: Any, command: str) -> str:
         """在沙箱里执行 shell 命令。"""
         t0 = time.perf_counter()
-        res = await sandbox.exec_shell(sandbox_id, command, timeout=60)
+        payload = _shell_with_proxy(command, proxy) if proxy else command
+        res = await sandbox.exec_shell(sandbox_id, payload, timeout=60)
         _report("run_shell", res.ok, t0)
         return _fmt(res, max_output)
 
