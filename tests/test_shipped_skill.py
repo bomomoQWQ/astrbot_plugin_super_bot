@@ -52,8 +52,13 @@ def test_shipped_skill_names_the_three_work_types():
     assert "superbot_dispatch" in text
 
 
-def test_shipped_skill_warns_sandbox_has_no_network():
-    """沙箱没外网是实测出来的边界；不写进说明书，模型就会一直派联网任务。"""
+def test_shipped_skill_tells_model_not_to_retry_network_failures():
+    """11 月 2 日那天：沙箱里 curl 失败 → 查 DNS → 换镜像，白烧 45 秒。
+
+    边界本身是环境相关的（能上网，但某些站点被封），所以要写死的是**行为**：
+    试一次，不通就停，并且如实说"访问不了"。
+    """
     text = _load().read("super-bot")
-    assert "没有外网" in text or "出不了网" in text
-    assert "clone" in text.lower() or "下载" in text
+    assert "只试一次" in text, "没写'只试一次'，模型会反复重试"
+    assert "别换镜像" in text or "别改 DNS" in text
+    assert "访问不了" in text, "得教它如实说'访问不了'，而不是'没找到'"
