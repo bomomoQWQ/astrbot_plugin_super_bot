@@ -780,6 +780,13 @@ class SuperBotPlugin(star.Star):
             "需要计算或查看环境时**必须**调用工具，不要凭记忆猜；"
             "拿到结果后用一两句话把结论说给人听，不要贴大段代码或日志。"
         )
+        if _sandbox_proxy():
+            base += (
+                "\n网络请求已经自动走代理（http_proxy 等环境变量都设好了），"
+                "直接 curl / urllib 抓就行，不用自己 export。"
+                "如果 `getent hosts` 把某个域名解析成 127.0.0.1，那是宿主机 DNS 的策略，"
+                "不代表走代理的请求会失败——以实际请求结果为准。"
+            )
         if self._skills is None:
             return base
         index = self._skills.index_text()

@@ -41,7 +41,15 @@ def _fmt(res: ExecResult, limit: int) -> str:
     if res.ok:
         return body or "（执行成功，无输出）"
     err = _clip((res.error or "未知错误"), limit)
-    return f"执行失败：{err}" + (f"\n已有输出：{body}" if body else "")
+    hint = ""
+    # 沙箱的 shell 通道要求输出是合法 UTF-8。`tail -c` / `head -c` 这类按字节
+    # 截断会把多字节字符切一半，服务端解码直接报错——真机上撞到过。
+    if "codec can't decode" in err or "invalid start byte" in err:
+        hint = (
+            "\n（这个命令的输出不是合法 UTF-8——按字节截断把中文切坏了。"
+            "改用 `python -c` 读文件、或者把命令接上 `| iconv -f utf-8 -t utf-8 -c` 清洗一下再输出。）"
+        )
+    return f"执行失败：{err}{hint}" + (f"\n已有输出：{body}" if body else "")
 
 
 def _shell_with_proxy(command: str, proxy: str) -> str:

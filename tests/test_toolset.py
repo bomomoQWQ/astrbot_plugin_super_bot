@@ -217,3 +217,20 @@ def test_proxy_quotes_are_stripped():
     out = _shell_with_proxy("echo hi", 'http://a"b:1')
     assert 'http://ab:1' in out
     assert out.count('"') == 10  # 5 对
+
+
+def test_utf8_failure_gets_a_hint():
+    """真机上撞到的：tail -c 把中文切一半，服务端解码失败。
+
+    失败本身没法在客户端修，但不能只回一句天书——要给模型一条出路。
+    """
+    from superbot.sandbox import ExecResult
+    from superbot.toolset import _fmt
+
+    res = ExecResult(
+        ok=False,
+        error="'utf-8' codec can't decode byte 0x88 in position 0: invalid start byte",
+    )
+    out = _fmt(res, 4000)
+    assert "执行失败" in out
+    assert "iconv" in out or "python -c" in out, "没给补救办法"
