@@ -342,13 +342,27 @@ def test_config_sandbox_flag(plugin_mod, monkeypatch):
     assert plugin_mod._sandbox_enabled() is False  # 默认关
 
 
-def test_config_agent_steps_clamped(plugin_mod):
+def test_agent_steps_is_only_a_fuse(plugin_mod):
+    """步数不再是约束（ADR-14）：配什么都不会低于保险丝。"""
+    ceiling = 999
     plugin_mod.configure({"agent": {"agent_steps": 0}})
-    assert plugin_mod._agent_max_steps() == 1
-    plugin_mod.configure({"agent": {"agent_steps": 999}})
-    assert plugin_mod._agent_max_steps() == 20
+    assert plugin_mod._agent_max_steps() == ceiling
+    plugin_mod.configure({"agent": {"agent_steps": 6}})
+    assert plugin_mod._agent_max_steps() == ceiling
     plugin_mod.configure({})
-    assert plugin_mod._agent_max_steps() == 6
+    assert plugin_mod._agent_max_steps() == ceiling
+
+
+def test_task_budget_config(plugin_mod, monkeypatch):
+    """真正的边界是时间预算，配置里能调。"""
+    monkeypatch.delenv("SUPERBOT_TASK_BUDGET_SEC", raising=False)
+    plugin_mod.configure({})
+    assert plugin_mod._task_budget_sec() == 1200.0
+    plugin_mod.configure({"agent": {"task_budget": 600}})
+    assert plugin_mod._task_budget_sec() == 600.0
+    # 太小会被抬到下限，避免配错了把任务秒杀
+    plugin_mod.configure({"agent": {"task_budget": 1}})
+    assert plugin_mod._task_budget_sec() == 60.0
 
 
 def test_config_bay_settings(plugin_mod, monkeypatch):

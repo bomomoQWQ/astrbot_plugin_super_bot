@@ -952,6 +952,15 @@ class SuperBotPlugin(star.Star):
     async def _prune_once(self) -> None:
         if self._store is None:
             return
+        # 内存里的轨迹也要清：/sb log 只对最近一小时的工单有意义，
+        # 再老的留着只是占内存（每个工单最多 200 条）。
+        cutoff = time.time() - 3600.0
+        for tid, trace in list(self._traces.items()):
+            if tid in self._ticket_ctx:
+                continue
+            last = trace[-1].at if trace else 0.0
+            if last < cutoff:
+                self._traces.pop(tid, None)
         try:
             await self._store.prune()
             counts = await self._store.counts()

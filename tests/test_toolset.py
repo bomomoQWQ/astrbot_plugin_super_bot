@@ -179,13 +179,30 @@ async def test_read_missing_file_is_reported():
 
 
 async def test_on_call_callback_reports():
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, bool, str]] = []
     sb = FakeSandbox()
-    tools = build_sandbox_tools(sb, "sb-1", on_call=lambda n, ok, ms: seen.append((n, ok)))
+    tools = build_sandbox_tools(
+        sb, "sb-1", on_call=lambda n, ok, ms, detail="": seen.append((n, ok, detail))
+    )
     await _tool(tools, "run_python").handler(None, code="print(1)")
     sb.python_result = ("err", "", "boom")
     await _tool(tools, "run_python").handler(None, code="1/0")
-    assert seen == [("run_python", True), ("run_python", False)]
+    assert [(n, ok) for n, ok, _ in seen] == [("run_python", True), ("run_python", False)]
+    # 参数摘要要一起传出来：watchdog 靠它判"是不是同一条命令反复跑"
+    assert seen[0][2] == "print(1)"
+    assert seen[1][2] == "1/0"
+
+
+async def test_on_call_digest_is_short_and_single_line():
+    """摘要必须单行且被截断——不能把多行代码整段塞进轨迹。"""
+    seen: list[str] = []
+    sb = FakeSandbox()
+    tools = build_sandbox_tools(
+        sb, "sb-1", on_call=lambda n, ok, ms, detail="": seen.append(detail)
+    )
+    await _tool(tools, "run_shell").handler(None, command="ls\n  -la\n" + "x" * 400)
+    assert "\n" not in seen[0]
+    assert len(seen[0]) <= 120
 
 
 # ---------------------------------------------------------------------------
