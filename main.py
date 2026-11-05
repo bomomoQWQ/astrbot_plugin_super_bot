@@ -1234,7 +1234,15 @@ class SuperBotPlugin(star.Star):
             if late is not None and late.outcome is not None:
                 return late
             if budget is None:
-                # 没有预算记录（比如重启后对账出来的工单）：给个上限，别无限等
+                # 可能是 _on_worker_done 刚好在这个空档把预算清了。
+                # 再看一眼任务本身，别把一个**已经跑完**的活判成"没结果"——
+                # 那会把 deliver 翻成 outbox，结果就和唤醒轮重复发了。
+                late = await self._workers.wait(assignment_id, timeout=2.0)
+                if late is not None:
+                    return late
+                late = self._workers.get(assignment_id)
+                if late is not None and late.outcome is not None:
+                    return late
                 return None
             if time.time() < budget["deadline"]:
                 continue

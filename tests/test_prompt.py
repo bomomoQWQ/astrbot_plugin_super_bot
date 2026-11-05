@@ -74,6 +74,15 @@ def test_exec_hint_says_do_not_wait_and_no_shell():
     assert "没有" in EXEC_HINT
 
 
+def test_exec_hint_warns_shell_tools_are_gone():
+    """线上实测：模型还是伸手去调 astrbot_execute_shell，白费一轮。
+
+    提示词得把"这些工具已经不存在"说死，别只说"你不必用"。
+    """
+    assert "astrbot_execute_shell" in EXEC_HINT
+    assert "不存在" in EXEC_HINT
+
+
 def test_skill_hint_points_at_read_skill():
     assert "read_skill" in SKILL_HINT
     assert "不用开沙箱" in SKILL_HINT

@@ -43,6 +43,8 @@ EXEC_HINT = (
     "- 读技能正文 → `read_skill`（直接返回文本，零开销）\n"
     "- 读技能目录里的脚本 → `read_skill(name, file=...)`（能读，不能跑）\n"
     "- 算数/跑代码/看环境/下载/处理文件 → `superbot_dispatch` 派给沙箱子代理\n"
+    "`astrbot_execute_shell` / `astrbot_execute_python` 这些工具**已经不存在**，"
+    "调用会被直接跳过、白费一轮——别调它们。\n"
     "派出去之后**立刻继续跟用户说话**，不要等待、不要轮询、不要说"
     "\"我看看\"\"稍等\"。结果会自己回来。\n"
     "不要建议用户去打开 Computer Use——那是别的插件的功能，这里不需要。\n"
