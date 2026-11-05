@@ -27,6 +27,19 @@ __all__ = ["build_sandbox_tools", "DEFAULT_MAX_OUTPUT"]
 DEFAULT_MAX_OUTPUT = 4000
 """工具输出上限（字符）。模型看不到的东西没必要塞进上下文，也省钱。"""
 
+DIGEST_MAX_CHARS = 120
+"""参数摘要的长度上限。
+
+用途：让 watchdog 判断"是不是在原地打转"——同一条命令反复出现三次以上
+就该有人看一眼。只取前若干字符，够区分就行，不必留全文。
+"""
+
+
+def _digest(text: str) -> str:
+    """把一次工具调用的参数压成短摘要（判重用）。"""
+    flat = " ".join((text or "").split())
+    return flat[:DIGEST_MAX_CHARS]
+
 
 def _clip(text: str, limit: int) -> str:
     text = text or ""
@@ -103,10 +116,15 @@ def build_sandbox_tools(
             都带上 ``http_proxy`` 之类的环境变量，从代理出口走。
     """
 
-    def _report(name: str, ok: bool, started: float) -> None:
+    def _report(name: str, ok: bool, started: float, detail: str = "") -> None:
         if on_call is not None:
             try:
-                on_call(name, ok, int((time.perf_counter() - started) * 1000))
+                on_call(
+                    name,
+                    ok,
+                    int((time.perf_counter() - started) * 1000),
+                    detail,
+                )
             except Exception:  # noqa: BLE001
                 pass
 
@@ -115,7 +133,7 @@ def build_sandbox_tools(
         t0 = time.perf_counter()
         payload = _python_with_proxy(code, proxy) if proxy else code
         res = await sandbox.exec_python(sandbox_id, payload, timeout=60)
-        _report("run_python", res.ok, t0)
+        _report("run_python", res.ok, t0, _digest(code))
         return _fmt(res, max_output)
 
     async def run_shell(event: Any, command: str) -> str:
@@ -123,7 +141,7 @@ def build_sandbox_tools(
         t0 = time.perf_counter()
         payload = _shell_with_proxy(command, proxy) if proxy else command
         res = await sandbox.exec_shell(sandbox_id, payload, timeout=60)
-        _report("run_shell", res.ok, t0)
+        _report("run_shell", res.ok, t0, _digest(command))
         return _fmt(res, max_output)
 
     async def write_file(event: Any, path: str, content: str) -> str:
@@ -136,7 +154,7 @@ def build_sandbox_tools(
         except Exception as exc:  # noqa: BLE001
             ok = False
             msg = f"写入失败：{exc}"
-        _report("write_file", ok, t0)
+        _report("write_file", ok, t0, _digest(path))
         return msg
 
     async def read_file(event: Any, path: str) -> str:
@@ -149,7 +167,7 @@ def build_sandbox_tools(
         except Exception as exc:  # noqa: BLE001
             ok = False
             msg = f"读取失败：{exc}"
-        _report("read_file", ok, t0)
+        _report("read_file", ok, t0, _digest(path))
         return msg
 
     tools = ToolSet()

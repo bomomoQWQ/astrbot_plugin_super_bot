@@ -74,9 +74,15 @@
       },
       "agent_steps": {
         "type": "int",
-        "description": "循环步数",
-        "hint": "Worker 的工具循环最多几步，越多越贵。默认 6",
-        "default": 6
+        "description": "循环步数（保险丝）",
+        "hint": "不再是主要约束。真正的边界是下面的「任务预算」；这个值默认 999，只防死循环",
+        "default": 999
+      },
+      "task_budget": {
+        "type": "int",
+        "description": "任务预算（秒）",
+        "hint": "单次派活的墙钟上限，默认 1200（20 分钟）。到点不直接杀——先让审查者看它还在不在干活，还在推进就自动续期",
+        "default": 1200
       },
       "bay_endpoint": {
         "type": "string",

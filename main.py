@@ -31,6 +31,7 @@ import asyncio
 import os
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +58,19 @@ if __package__:
         decide,
     )
     from .superbot.outbox import Outbox  # noqa: F401
+    from .superbot.prompt import (  # noqa: F401
+        COMPUTER_USE_MARKER,
+        EXEC_HINT,
+        SKILL_HINT,
+        strip_computer_use_notice,
+    )
     from .superbot.router import Reply, Router, Trigger  # noqa: F401
+    from .superbot.review import (  # noqa: F401
+        Step,
+        classify_activity,
+        format_trace,
+        parse_verdict,
+    )
     from .superbot.sandbox import (  # noqa: F401
         BaySandbox,
         SandboxPort,
@@ -91,7 +104,19 @@ else:
         decide,
     )
     from superbot.outbox import Outbox  # noqa: F401
+    from superbot.prompt import (  # noqa: F401
+        COMPUTER_USE_MARKER,
+        EXEC_HINT,
+        SKILL_HINT,
+        strip_computer_use_notice,
+    )
     from superbot.router import Reply, Router, Trigger  # noqa: F401
+    from superbot.review import (  # noqa: F401
+        Step,
+        classify_activity,
+        format_trace,
+        parse_verdict,
+    )
     from superbot.sandbox import (  # noqa: F401
         BaySandbox,
         SandboxPort,
@@ -184,7 +209,17 @@ WORKER_DELAY_ENV = "SUPERBOT_WORKER_DELAY"
 """
 
 AGENT_STEPS_ENV = "SUPERBOT_AGENT_STEPS"
-"""Worker 的工具循环最多几步（默认 6）。"""
+"""**已废弃**：步数不再是约束（ADR-14），改用时间预算 + 活动信号。
+
+仍然认这个环境变量，是为了让老配置不至于失效——它现在只调
+``tool_loop_agent`` 的保险丝上限。
+"""
+
+TASK_BUDGET_ENV = "SUPERBOT_TASK_BUDGET_SEC"
+"""单工单墙钟预算（秒），默认 1200。到期先交审查者判断，不直接杀。"""
+
+TASK_BUDGET_EXTEND_ENV = "SUPERBOT_TASK_BUDGET_EXTEND_SEC"
+"""审查者判"仍在推进"时一次续期多少秒，默认 600。"""
 
 WATCHDOG_TICK_ENV = "SUPERBOT_WATCHDOG_TICK_SEC"
 """watchdog 扫描间隔（秒），默认 60。测试会调很小。"""
@@ -207,10 +242,17 @@ TOOL_RESULT_MAX_CHARS = 1200
 超了就把全文直接发给用户，只把前 1200 字交给模型——不然一次派活
 就能把上下文塞满，后面的对话全被挤没。"""
 
+_COMPUTER_USE_MARKER = COMPUTER_USE_MARKER
+
+
+
+
 HELP_TEXT = """/sb —— Super Bot
 
 /sb              看状态（同 /sb status）
 /sb do <任务>     跳过判断，直接派给沙箱子代理去干
+/sb ls           看在跑的工单（还剩多少时间）
+/sb log <工单号>  看这个工单调了什么工具、成没成
 /sb help         看这段说明"""
 
 
@@ -363,9 +405,45 @@ class SuperBotPlugin(star.Star):
         self._stop: asyncio.Event | None = None
         self._router_task: asyncio.Task | None = None
         self._ticket_ctx: dict[str, dict[str, Any]] = {}
+        # 活动轨迹（ADR-14）：工单 -> 最近的工具调用。watchdog 靠它判断
+        # "是在推进还是在原地打转"，不再靠数步数。
+        self._traces: dict[str, deque[Step]] = {}
+        # 工单预算：ticket -> {"started": t, "deadline": t, "extensions": n}
+        self._budgets: dict[str, dict[str, float]] = {}
+        # 正在跑的 Worker 协程任务，审查者判 stop 时要能取消它
+        self._worker_tasks: dict[str, asyncio.Task] = {}
+        # Thread 订阅表：thread_key -> 正在处理它的工单（ADR-15 订阅直通）。
+        # 文章的原话是"Router 仍然观测所有事件，只是不再转发已订阅的事件"——
+        # 所以命中订阅时我们**不跳过记录**，只是短路掉那次模型判断。
+        self._subs: dict[str, str] = {}
         self._started_at = 0.0
 
     # -- 生命周期（必须直接定义在本类里） ----------------------------------
+
+    def _mark_dispatch_background(self) -> None:
+        """把 ``superbot_dispatch`` 标成后台任务。
+
+        装饰器 ``@filter.llm_tool`` 没有透传 ``is_background_task`` 的入口
+        （全仓只有 ``tool.py:61`` 定义字段、``astr_agent_tool_exec.py:161``
+        消费它），所以注册完再翻这个开关。
+
+        翻了之后：模型调用它 → 执行器立刻回一句 "Background task submitted"，
+        真正的活在我们自己的协程里跑；跑完框架会唤醒主 agent，把结果交回去
+        （``_wake_main_agent_for_background_result``）。
+        """
+        try:
+            tmgr = self.context.get_llm_tool_manager()
+            tool = tmgr.get_func("superbot_dispatch")
+            if tool is None:
+                logger.warning(
+                    "%s 找不到 superbot_dispatch 工具，派活仍是同步的", LOG_TAG
+                )
+                return
+            tool.is_background_task = True
+            logger.info("%s superbot_dispatch -> 后台任务模式（派完即返）", LOG_TAG)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s 标记后台任务失败: %s", LOG_TAG, exc)
+
 
     async def initialize(self) -> None:
         started = time.perf_counter()
@@ -437,6 +515,9 @@ class SuperBotPlugin(star.Star):
         self._watchdog_task = asyncio.create_task(
             self._watchdog_loop(), name="superbot-watchdog"
         )
+        # 派活改成后台任务：模型派完立刻返回，结果由框架唤醒主 agent 补一句
+        # （``astr_agent_tool_exec.py:161-186`` 的 is_background_task 分支）。
+        self._mark_dispatch_background()
         # 定期清理：disposition 每条消息写一行，不清就无限长
         self._housekeeping_task = asyncio.create_task(
             self._housekeeping_loop(), name="superbot-housekeeping"
@@ -600,6 +681,7 @@ class SuperBotPlugin(star.Star):
                 if self._watchdog is not None:
                     for action in self._watchdog.tick():
                         await self._on_watchdog_action(action)
+                await self._scan_activity()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("%s watchdog tick failed: %s", LOG_TAG, exc)
             try:
@@ -646,6 +728,176 @@ class SuperBotPlugin(star.Star):
         await self._fact(ticket_id, "blocked", "stalled-to-death")
         await self._emit_user(ticket_id, "这次没跑完，我已经放弃了。")
         self._ticket_ctx.pop(ticket_id, None)
+
+    # -- 活动审查（ADR-14：不数步数，看"还在不在干活"） --------------------
+
+    def _review_inflight(self, ticket_id: str) -> bool:
+        """这张工单正在被审查吗？"""
+        return bool((self._ticket_ctx.get(ticket_id) or {}).get("reviewing"))
+
+    async def _scan_activity(self) -> None:
+        """每个 tick 看一遍在跑的工单：卡住了就叫审查者。
+
+        三条信号来自 ``superbot/review.py``（静默 / 原地打转 / 连续失败），
+        外加一条"预算到期"。命中任一条才叫审查者——正常情况下一个 tick
+        什么也不做，不烧钱。
+        """
+        now = time.time()
+        for ticket_id, budget in list(self._budgets.items()):
+            ctx = self._ticket_ctx.get(ticket_id)
+            if ctx is None or ctx.get("done"):
+                continue
+            if self._review_inflight(ticket_id):
+                continue
+            last = float(ctx.get("last_review") or 0.0)
+            if now - last < limits.REVIEW_COOLDOWN_SEC:
+                continue
+            started = float(budget.get("started") or now)
+            trace = list(self._traces.get(ticket_id) or [])
+            signal = classify_activity(trace, now, started_at=started)
+            over_budget = now >= float(budget.get("deadline") or 0)
+            if signal is None and not over_budget:
+                continue
+            await self._review_ticket(
+                ticket_id,
+                signal=signal or "budget",
+                elapsed=now - started,
+            )
+
+    async def _review_ticket(
+        self, ticket_id: str, *, signal: str, elapsed: float
+    ) -> None:
+        """叫审查者看一眼轨迹，再决定 继续 / 重派 / 停下。"""
+        ctx = self._ticket_ctx.get(ticket_id)
+        if ctx is None or ctx.get("reviewing"):
+            return
+        trace = list(self._traces.get(ticket_id) or [])
+        ctx["reviewing"] = True
+        ctx["last_review"] = time.time()
+        try:
+            verdict, reason = await self._ask_reviewer(
+                ticket_id, ctx, trace, signal=signal, elapsed=elapsed
+            )
+        finally:
+            ctx.pop("reviewing", None)
+
+        logger.warning(
+            "%s review ticket=%s signal=%s -> %s %s",
+            LOG_TAG,
+            ticket_id[:8],
+            signal,
+            verdict,
+            reason[:80],
+        )
+
+        if verdict == "continue":
+            self._extend_budget(ticket_id)
+            await self._fact(ticket_id, "review_continue", f"{signal}: {reason}"[:200])
+            return
+
+        if verdict == "replan":
+            await self._fact(ticket_id, "review_replan", f"{signal}: {reason}"[:200])
+            base = str(ctx.get("task") or ctx.get("plan") or "")
+            if reason:
+                ctx["task"] = f"{base}\n\n[审查建议] {reason}"[:2000]
+            self._traces.pop(ticket_id, None)
+            await self._emit_user(ticket_id, "这个任务卡了一下，我换个思路重跑。")
+            await self._retry_ticket(ticket_id, reason=f"review: {reason}"[:120])
+            return
+
+        # stop
+        await self._fact(ticket_id, "blocked", f"review-stop: {signal}: {reason}"[:200])
+        await self._cancel_worker(ticket_id)
+        await self._emit_user(
+            ticket_id, f"这个任务我停了：{(reason or '一直没进展')[:150]}"
+        )
+        ctx["done"] = True
+
+    async def _ask_reviewer(
+        self,
+        ticket_id: str,
+        ctx: dict[str, Any],
+        trace: list[Step],
+        *,
+        signal: str,
+        elapsed: float,
+    ) -> tuple[str, str]:
+        """把轨迹喂给模型，问它"这活还在推进吗"。
+
+        只在异常时调用，所以用当前会话的模型就够了，不必另配。
+        拿不到模型时保守返回 ``continue``：宁可多跑一会儿，
+        也不要因为审查器坏了误杀正常任务。
+        """
+        if make_synthetic_event is None:
+            return "continue", ""
+        umo = str(ctx.get("umo") or "")
+        if not umo:
+            return "continue", ""
+
+        task = str(ctx.get("task") or ctx.get("plan") or "")[:800]
+        prompt = (
+            "你是任务监督员。下面是一个执行中的任务，以及它最近的工具调用轨迹。\n\n"
+            f"任务：{task}\n"
+            f"已运行：{elapsed:.0f} 秒\n"
+            f"触发的信号：{signal}\n\n"
+            f"轨迹：\n{format_trace(trace)}\n\n"
+            "请判断：它是在**有效推进**，还是**原地打转/卡死**？\n"
+            "只输出一个词，然后可选的短理由：\n"
+            "  continue —— 还在干活，给它更多时间\n"
+            "  replan <换个什么思路> —— 方向错了，应该换做法\n"
+            "  stop <为什么> —— 没救了，停下\n"
+            "不要输出别的。"
+        )
+        try:
+            event = make_synthetic_event(self.context, umo, "review")
+            provider_id = await self.context.get_current_chat_provider_id(umo)
+            resp = await self.context.tool_loop_agent(
+                event=event,
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=(
+                    "你是冷静的任务监督员，只看证据说话。"
+                    "输出的第一个词必须是 continue、replan 或 stop。"
+                ),
+                max_steps=1,
+                tool_call_timeout=60,
+            )
+            text = (getattr(resp, "completion_text", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s reviewer failed: %s", LOG_TAG, exc)
+            return "continue", ""
+        return parse_verdict(text)
+
+    def _extend_budget(self, ticket_id: str) -> None:
+        """审查者判"还在推进"时给预算续期。"""
+        budget = self._budgets.get(ticket_id)
+        if budget is None:
+            return
+        used = int(budget.get("extensions", 0))
+        if used >= limits.MAX_BUDGET_EXTENSIONS:
+            logger.warning(
+                "%s ticket=%s 续期已用尽（%d 次）", LOG_TAG, ticket_id[:8], used
+            )
+            return
+        budget["extensions"] = used + 1
+        budget["deadline"] = time.time() + _budget_extend_sec()
+        logger.info(
+            "%s ticket=%s 预算续期 #%d，新截止 +%.0fs",
+            LOG_TAG,
+            ticket_id[:8],
+            used + 1,
+            _budget_extend_sec(),
+        )
+
+    async def _cancel_worker(self, ticket_id: str) -> None:
+        """停掉某张工单正在跑的 Worker。"""
+        assignment_id = self._assignment_ids.get(ticket_id)
+        if self._workers is None or not assignment_id:
+            return
+        try:
+            await self._workers.cancel(assignment_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s cancel ticket=%s failed: %s", LOG_TAG, ticket_id[:8], exc)
 
     async def _retry_ticket(self, ticket_id: str, *, reason: str = "") -> bool:
         """重跑一张工单：先取消卡住的那次，再重新提交。"""
@@ -749,10 +1001,93 @@ class SuperBotPlugin(star.Star):
         if sub in ("do", "run", "task"):
             yield event.plain_result(await self._do_direct(event, rest))
             return
+        if sub in ("ls", "list", "jobs"):
+            yield event.plain_result(await self._list_text())
+            return
+        if sub in ("log", "logs", "trace"):
+            yield event.plain_result(await self._log_text(rest))
+            return
         if sub in ("help", "?", "-h", "--help"):
             yield event.plain_result(HELP_TEXT)
             return
         yield event.plain_result(f"没有这个子命令：{sub}\n\n{HELP_TEXT}")
+
+    async def _list_text(self) -> str:
+        """``/sb ls`` —— 现在有什么在跑、最近干完了什么。
+
+        主 agent 没有 shell 之后，这是用户唯一能看到"任务视图"的地方：
+        不然问一句"那个跑完没"只能靠猜。
+        """
+        now = time.time()
+        rows: list[str] = []
+
+        running = [
+            (tid, ctx)
+            for tid, ctx in self._ticket_ctx.items()
+            if not ctx.get("done")
+        ]
+        if running:
+            rows.append("在跑：")
+            for tid, ctx in running[:10]:
+                budget = self._budgets.get(tid) or {}
+                started = budget.get("started") or ctx.get("started") or now
+                elapsed = now - float(started)
+                left = max(0.0, float(budget.get("deadline", now)) - now)
+                task = str(ctx.get("task") or ctx.get("plan") or "")[:40]
+                rows.append(
+                    f"　{tid[:8]}  {elapsed:.0f}s / 还剩 {left:.0f}s  {task}"
+                )
+        else:
+            rows.append("在跑：没有")
+
+        if self._store is not None:
+            try:
+                open_ids = await self._store.open_tickets(limit=10)
+                stale = [t for t in open_ids if t not in self._ticket_ctx]
+                if stale:
+                    rows.append(f"库里的未结工单：{len(stale)} 个（重启前的，已标记中断）")
+            except Exception:  # noqa: BLE001
+                pass
+
+        if self._skills is not None:
+            rows.append(f"技能：{len(self._skills.list())} 个")
+        rows.append("看某个工单干了什么：/sb log <工单号前8位>")
+        return "\n".join(rows)
+
+    async def _log_text(self, arg: str) -> str:
+        """``/sb log <工单号>`` —— 这个工单都调了什么工具、成没成。"""
+        key = (arg or "").strip().split()[0] if arg.strip() else ""
+        if not key:
+            # 没给工单号：给他最近那个
+            if not self._traces:
+                return "现在没有可看的工单。先用 /sb ls 看看有哪些。"
+            key = next(reversed(self._traces))
+
+        ticket_id = next(
+            (tid for tid in self._traces if tid.startswith(key)), None
+        )
+        if ticket_id is None:
+            return f"没找到工单 {key}。用 /sb ls 看看在跑的工单号。"
+
+        trace = list(self._traces.get(ticket_id) or [])
+        budget = self._budgets.get(ticket_id) or {}
+        ctx = self._ticket_ctx.get(ticket_id) or {}
+        head = [
+            f"工单 {ticket_id[:8]}",
+            f"　任务：{str(ctx.get('task') or ctx.get('plan') or '')[:120]}",
+            f"　状态：{'在跑' if ticket_id in self._worker_tasks else '结束/未知'}",
+        ]
+        if budget:
+            head.append(
+                f"　预算：{(time.time() - float(budget.get('started', 0))):.0f}s 已用，"
+                f"续期 {int(budget.get('extensions', 0))} 次"
+            )
+        if not trace:
+            head.append("　轨迹：还没有工具调用")
+            return "\n".join(head)
+        head.append(f"　轨迹（{len(trace)} 步）：")
+        head.append(format_trace(trace, limit=2500, max_items=24))
+        return "\n".join(head)
 
     async def _do_direct(self, event: AstrMessageEvent, task: str) -> str:
         """``/sb do <任务>``：跳过 Router 的模型判断，直接开票给 Worker。"""
@@ -803,13 +1138,17 @@ class SuperBotPlugin(star.Star):
 
     @filter.llm_tool(name="superbot_dispatch")
     async def superbot_dispatch(self, event: AstrMessageEvent, task: str = "") -> str:
-        """把需要真正动手的任务派给沙箱子代理执行，并等它把结果带回来。
+        """把需要真正动手的任务派给沙箱子代理。**派完立刻返回，绝对不要等结果。**
 
         什么时候该用：用户要你**真去执行**——算数、跑代码、处理数据、看环境、
         下载或转换文件。这种活你自己答不出来，必须交给能跑的沙箱。
 
         什么时候别用：闲聊、寒暄、解释概念、你凭上下文就能回答的问题。
         也别用它来复述用户的话——派下去的任务要写清楚要做什么。
+
+        **调用后你会立刻看到 "Background task submitted"，那就是活已经在跑了。**
+        不要等待、不要轮询、不要问"跑完了吗"、也不要说"我看看/稍等"——
+        直接继续跟用户聊别的事。结果跑完会自动回到你的上下文里，那时候再说话。
 
         Args:
             task(string): 要执行的任务，写清楚目标和参数
@@ -828,19 +1167,13 @@ class SuperBotPlugin(star.Star):
             return "派活失败。"
 
         assignment_id = self._assignment_ids.get(ticket_id, "")
-        done = await self._workers.wait(assignment_id, timeout=_tool_wait_timeout())
+        done = await self._await_assignment(ticket_id, assignment_id)
         if done is None:
-            # 超时。先确认是不是刚好在这一刻跑完了（那样直接给结果）
-            late = self._workers.get(assignment_id)
-            if late is not None and late.outcome is not None:
-                if late.outcome is Outcome.FAILED:
-                    return f"执行失败：{(late.error or late.text or '未知原因')[:300]}"
-                return late.text or "（执行完了，但没有输出）"
-            # 真还在跑：切成"跑完直接发消息"，结果不会丢
+            # 预算耗尽且审查者也没同意续期：切成"跑完直接发消息"，结果不会丢
             ctx = self._ticket_ctx.get(ticket_id)
             if ctx is not None:
                 ctx["deliver"] = "outbox"
-            return "任务还在跑，比预期久；跑完我会直接把结果发给你，不用重复问。"
+            return "这个任务比预算久太多，我先把它转到后台；跑完我直接把结果发给你。"
         if done.outcome is Outcome.FAILED:
             return f"执行失败：{(done.error or done.text or '未知原因')[:300]}"
         if done.outcome is Outcome.CANCELLED:
@@ -865,6 +1198,37 @@ class SuperBotPlugin(star.Star):
             )
         return text or "（执行完了，但没有输出）"
 
+    async def _await_assignment(
+        self, ticket_id: str, assignment_id: str
+    ) -> Any | None:
+        """等一个 Worker 完成，期间允许审查者续期。
+
+        不用一次性 ``wait(timeout=预算)``：预算被审查者续过之后，
+        原来那个超时点就不再是终点。这里分小段等，每段醒来重新读预算。
+        """
+        if self._workers is None:
+            return None
+        while True:
+            budget = self._budgets.get(ticket_id)
+            remaining = (
+                max(5.0, budget["deadline"] - time.time()) if budget else 300.0
+            )
+            chunk = min(remaining, 60.0)
+            done = await self._workers.wait(assignment_id, timeout=chunk)
+            if done is not None:
+                return done
+            late = self._workers.get(assignment_id)
+            if late is not None and late.outcome is not None:
+                return late
+            if budget is None:
+                # 没有预算记录（比如重启后对账出来的工单）：给个上限，别无限等
+                return None
+            if time.time() < budget["deadline"]:
+                continue
+            # 预算到期还没续期——交给审查者；它没在跑就收工
+            if not self._review_inflight(ticket_id):
+                return None
+
     @filter.llm_tool(name="read_skill")
     async def read_skill(self, event: AstrMessageEvent, name: str, file: str = "") -> str:
         """读某个技能的完整说明（SKILL.md），或技能目录里的某个文件。
@@ -884,23 +1248,39 @@ class SuperBotPlugin(star.Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
-        """给主 agent 说清楚：读技能有比开沙箱更快的路。
+        """接管主 agent 的执行能力说明。
 
-        框架的技能提示词要求模型用 shell 读 ``SKILL.md``
-        （``skill_manager.py:269-273``），而 ``computer_use_runtime=sandbox`` 时
-        那等于先起一个沙箱。这里把更省事的路径讲明白。
+        做两件事：
+
+        1. **删掉框架那句误导**。``computer_use_runtime=none`` 时框架会追加
+           "You cannot use shell or Python to perform skills... ask the user to
+           enable Computer Use"（``astr_main_agent.py:593-598``）。我们刻意
+           关掉主 agent 的沙箱，让它派活给 Worker——那句话会让模型反过来劝
+           用户去改设置。**必须真删，不是加一句压它**（两句并存时模型信哪句
+           没准）。钩子在 ``_decorate_llm_request`` 之后触发、拿到同一个
+           ``req`` 对象，所以改字符串有效。
+
+        2. 补上我们的路线：读技能用 ``read_skill``，执行一律派活、派完别等。
         """
-        if self._skills is None or not self._skills.list():
-            return
         try:
             prompt = req.system_prompt or ""
-            if "[技能读取]" in prompt:
-                return
-            req.system_prompt = prompt + (
-                "\n[技能读取]\n"
-                "需要看某个技能的 SKILL.md 时，**优先调用 `read_skill` 工具**"
-                "（直接返回正文，不用开沙箱）；只有要跑技能里的脚本时，才在沙箱里操作。\n"
-            )
+            prompt, removed = strip_computer_use_notice(prompt)
+            if removed:
+                logger.debug("%s 已移除框架的 computer_use 提示", LOG_TAG)
+            elif COMPUTER_USE_MARKER in prompt:
+                logger.warning(
+                    "%s 框架的 computer_use 提示文案变了，没能删掉——"
+                    "去 superbot/prompt.py 里更新匹配串",
+                    LOG_TAG,
+                )
+
+            if EXEC_HINT not in prompt:
+                prompt = prompt + EXEC_HINT
+
+            if self._skills is not None and self._skills.list():
+                if "[技能读取]" not in prompt:
+                    prompt += SKILL_HINT
+            req.system_prompt = prompt
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s on_llm_request failed: %s", LOG_TAG, exc)
 
@@ -917,12 +1297,21 @@ class SuperBotPlugin(star.Star):
         if self._workers is None:
             return None
         ticket_id = ticket_id_from_eval(f"{thread}:{time.time():.6f}:{task[:40]}")
+        now = time.time()
+        budget = _task_budget_sec()
         self._ticket_ctx[ticket_id] = {
             "umo": umo,
             "thread_key": thread,
             "task": task,
             "batch": 1,
             "deliver": deliver,
+            "started": now,
+        }
+        # 预算取代步数（ADR-14）：到点先交审查者，不直接杀
+        self._budgets[ticket_id] = {
+            "started": now,
+            "deadline": now + budget,
+            "extensions": 0,
         }
         await self._open_ticket(ticket_id, thread, f"direct:{task[:40]}")
         assignment_id = await self._workers.submit(
@@ -984,10 +1373,19 @@ class SuperBotPlugin(star.Star):
             self._watchdog.touch(ticket_id)
 
     def _on_tool_call(self, ticket_id: str):
-        """造一个给 toolset 用的回调：打日志 + 报进展。"""
+        """造一个给 toolset 用的回调：打日志 + 记轨迹 + 报进展。
 
-        def _cb(name: str, ok: bool, ms: int) -> None:
-            logger.info("%s tool %s ok=%s %dms", LOG_TAG, name, ok, ms)
+        ``digest`` 是参数摘要，watchdog 靠它认"同一条命令反复跑"
+        （``superbot/review.py`` 的 repeat 信号）。
+        """
+
+        def _cb(name: str, ok: bool, ms: int, detail: str = "") -> None:
+            logger.info("%s tool %s ok=%s %dms %s", LOG_TAG, name, ok, ms, detail[:60])
+            trace = self._traces.get(ticket_id)
+            if trace is None:
+                trace = deque(maxlen=limits.TRACE_MAX_ENTRIES)
+                self._traces[ticket_id] = trace
+            trace.append(Step(at=time.time(), name=name, ok=ok, ms=ms, digest=detail))
             self._touch(ticket_id)
 
         return _cb
@@ -1062,6 +1460,10 @@ class SuperBotPlugin(star.Star):
             await self._fact(ticket_id, "accepted", mandate[:200])
         if self._watchdog is not None:
             self._watchdog.watch(ticket_id)
+        # 建立 Thread 订阅：这个 Thread 后续的消息直通给这张工单，
+        # 不再逐条过 Router 的模型判断（ADR-15）
+        if thread:
+            self._subs[thread] = ticket_id
 
     # -- 主处理器 ----------------------------------------------------------
 
@@ -1086,6 +1488,23 @@ class SuperBotPlugin(star.Star):
         thread = ""
         if decision.verdict is Verdict.ROUTE:
             thread = thread_key(view, reply_ref=_reply_ref(event))
+            subscribed = self._active_ticket_for(thread)
+            if subscribed is not None:
+                # 订阅直通（ADR-15）：事件照样记账、照样落盘，**只是不做决策**。
+                # 省掉的是这一次 Router 模型调用，不是这次观测。
+                await self._observe_for_ticket(subscribed, view)
+                await self._persist_trigger(view, thread, event)
+                await self._record(view, decision, thread)
+                logger.info(
+                    "%s gate=%s reason=%s+subscribed ticket=%s chat=%s text=%r",
+                    LOG_TAG,
+                    decision.verdict.value,
+                    decision.reason,
+                    subscribed[:8],
+                    view.chat_key,
+                    view.message_str[:40],
+                )
+                return
             self._enqueue(view, thread, event)
             await self._persist_trigger(view, thread, event)
 
@@ -1103,6 +1522,33 @@ class SuperBotPlugin(star.Star):
         return
 
     # -- Router 输入 -------------------------------------------------------
+
+    def _active_ticket_for(self, thread: str) -> str | None:
+        """这个 Thread 有没有活着的工单在处理（有就直通，不再排队）。"""
+        ticket_id = self._subs.get(thread)
+        if not ticket_id:
+            return None
+        if ticket_id in self._ticket_ctx and ticket_id not in self._worker_tasks:
+            # 已经收工了，只是订阅表还没清
+            self._subs.pop(thread, None)
+            return None
+        return ticket_id
+
+    async def _observe_for_ticket(self, ticket_id: str, view: EventView) -> None:
+        """把"看见了但没转发"这件事记下来。
+
+        Worker 是独立上下文，追加不了它的实时输入——所以这里不假装"消息
+        已经送进去了"，而是如实记一条观测：谁在什么时候说了什么。
+        工单收尾时 Router 能据此补一句，用户也不至于觉得"我说话没人理"。
+        """
+        ctx = self._ticket_ctx.get(ticket_id)
+        if ctx is None:
+            return
+        note = f"{view.sender_id}: {view.message_str[:200]}"
+        notes = ctx.setdefault("observed", [])
+        notes.append(note)
+        del notes[:-20]  # 只留最近 20 条
+        await self._fact(ticket_id, "observed", note[:200])
 
     def _enqueue(self, view: EventView, thread: str, event: AstrMessageEvent) -> None:
         if self._router is None:
@@ -1227,13 +1673,20 @@ class SuperBotPlugin(star.Star):
             return []
 
         ticket_id = ticket_id_from_eval(f"{thread}:{batch[0].id}")
+        now = time.time()
         self._ticket_ctx[ticket_id] = {
             "umo": umo,
             "thread_key": thread,
             "batch": len(batch),
             "plan": plan,
+            "started": now,
             # Worker 干活要用**原始消息**，不能用 Router 提炼的一句话
             "task": "\n".join(t.text for t in batch[:10]),
+        }
+        self._budgets[ticket_id] = {
+            "started": now,
+            "deadline": now + _task_budget_sec(),
+            "extensions": 0,
         }
         if self._workers is not None:
             await self._open_ticket(ticket_id, thread, f"live batch={len(batch)}")
@@ -1261,6 +1714,10 @@ class SuperBotPlugin(star.Star):
         取消时也一样，否则容器继续占配额）。
         """
         ctx = self._ticket_ctx.get(ticket.id) or {}
+        # 记下自己这个协程任务：审查者判 stop 时要能取消它
+        current = asyncio.current_task()
+        if current is not None:
+            self._worker_tasks[ticket.id] = current
 
         can_agent = (
             self._sandbox is not None
@@ -1382,6 +1839,11 @@ class SuperBotPlugin(star.Star):
         if self._watchdog is not None:
             self._watchdog.finish(ticket_id)
         self._ticket_ctx.pop(ticket_id, None)
+        self._budgets.pop(ticket_id, None)
+        self._worker_tasks.pop(ticket_id, None)
+        for key, tid in list(self._subs.items()):
+            if tid == ticket_id:
+                self._subs.pop(key, None)
         self._unregister_stop_hook(ticket_id)
         if not umo:
             return
@@ -1690,19 +2152,50 @@ def _keepalive_interval() -> float:
 
 
 def _agent_max_steps() -> int:
-    """Worker 的工具循环最多跑几步（默认 6）。
+    """``tool_loop_agent`` 的步数**保险丝**（默认 999，不是约束）。
 
-    6 步够"查一次 → 算一次 → 汇总"这种典型任务；再多就是在烧钱绕圈。
+    以前这里是硬上限 6，实测三个真任务全部撞顶被强制收尾——数步数
+    根本说不清一次任务该多长（ADR-14）。现在真正的边界是
+    ``_task_budget_sec()`` 的时间预算 + 活动审查，这里只防"永远不退出"。
+
+    仍然认 ``agent.agent_steps`` 配置项：老用户把它调到 20 也不会出事，
+    只是它现在成了"上限之上的上限"。
     """
     raw = _conf_get("agent", "agent_steps")
     if os.environ.get(AGENT_STEPS_ENV):
         raw = os.environ.get(AGENT_STEPS_ENV)
     if raw is None:
-        return 6
+        return limits.WORKER_STEP_CEILING
     try:
-        return max(1, min(20, int(raw)))
+        asked = int(raw)
     except (TypeError, ValueError):
-        return 6
+        return limits.WORKER_STEP_CEILING
+    # 配置里给的数只作为"额外保险"，永远不低于默认保险丝
+    return max(asked, limits.WORKER_STEP_CEILING)
+
+
+def _task_budget_sec() -> float:
+    """单工单墙钟预算（秒），默认 20 分钟。配置 > 环境变量 > 默认。"""
+    raw = _conf_get("agent", "task_budget")
+    if os.environ.get(TASK_BUDGET_ENV):
+        raw = os.environ.get(TASK_BUDGET_ENV)
+    if raw is None:
+        return limits.DEFAULT_TASK_BUDGET_SEC
+    try:
+        return max(60.0, float(raw))
+    except (TypeError, ValueError):
+        return limits.DEFAULT_TASK_BUDGET_SEC
+
+
+def _budget_extend_sec() -> float:
+    """审查者判"还在推进"时一次续期多少秒，默认 10 分钟。"""
+    raw = os.environ.get(TASK_BUDGET_EXTEND_ENV)
+    if not raw:
+        return limits.BUDGET_EXTENSION_SEC
+    try:
+        return max(30.0, float(raw))
+    except ValueError:
+        return limits.BUDGET_EXTENSION_SEC
 
 
 def _watchdog_interval() -> float:
