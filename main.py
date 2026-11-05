@@ -62,6 +62,8 @@ if __package__:
         COMPUTER_USE_MARKER,
         EXEC_HINT,
         SKILL_HINT,
+        WAKE_HINT,
+        WAKE_MARKER,
         strip_computer_use_notice,
     )
     from .superbot.router import Reply, Router, Trigger  # noqa: F401
@@ -108,6 +110,8 @@ else:
         COMPUTER_USE_MARKER,
         EXEC_HINT,
         SKILL_HINT,
+        WAKE_HINT,
+        WAKE_MARKER,
         strip_computer_use_notice,
     )
     from superbot.router import Reply, Router, Trigger  # noqa: F401
@@ -1255,6 +1259,33 @@ class SuperBotPlugin(star.Star):
             return "技能库没加载。"
         return self._skills.read(name, file or None)
 
+    def _ensure_background_flag(self, req: Any) -> None:
+        """每次请求都把"后台任务"标记打到位。
+
+        为什么不能只在启动时翻一次：``get_full_tool_set()`` 会把插件工具包进
+        ``_PermissionGuardedTool``（``func_tool_manager.py:214``），而那个包装器
+        只复制 name/description/parameters/active，**不复制
+        ``is_background_task``**。所以请求里的那一份永远是默认 False——
+        执行器看到 False 就走同步分支，模型又变成了"卡着等结果"。
+
+        这里直接改请求里的那份（包装器和被包装的都改），才是执行器实际读的。
+        """
+        toolset = getattr(req, "func_tool", None)
+        tools = getattr(toolset, "tools", None) or []
+        for tool in tools:
+            if getattr(tool, "name", "") != "superbot_dispatch":
+                continue
+            try:
+                tool.is_background_task = True
+            except Exception:  # noqa: BLE001
+                pass
+            inner = getattr(tool, "_wrapped", None)
+            if inner is not None:
+                try:
+                    inner.is_background_task = True
+                except Exception:  # noqa: BLE001
+                    pass
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
         """接管主 agent 的执行能力说明。
@@ -1272,6 +1303,7 @@ class SuperBotPlugin(star.Star):
         2. 补上我们的路线：读技能用 ``read_skill``，执行一律派活、派完别等。
         """
         try:
+            self._ensure_background_flag(req)
             prompt = req.system_prompt or ""
             prompt, removed = strip_computer_use_notice(prompt)
             if removed:
@@ -1289,6 +1321,8 @@ class SuperBotPlugin(star.Star):
             if self._skills is not None and self._skills.list():
                 if "[技能读取]" not in prompt:
                     prompt += SKILL_HINT
+            if WAKE_MARKER in prompt and "[后台任务结果]" not in prompt:
+                prompt += WAKE_HINT
             req.system_prompt = prompt
         except Exception as exc:  # noqa: BLE001
             logger.warning("%s on_llm_request failed: %s", LOG_TAG, exc)

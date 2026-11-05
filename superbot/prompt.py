@@ -26,6 +26,8 @@ __all__ = [
     "COMPUTER_USE_MARKER",
     "EXEC_HINT",
     "SKILL_HINT",
+    "WAKE_HINT",
+    "WAKE_MARKER",
     "strip_computer_use_notice",
 ]
 
@@ -51,6 +53,24 @@ SKILL_HINT = (
     "需要看某个技能的 SKILL.md 时，**优先调用 `read_skill` 工具**"
     "（直接返回正文，不用开沙箱，也不要有 shell）。\n"
 )
+
+WAKE_MARKER = "# BACKGROUND TASK CONTEXT"
+"""框架"后台任务跑完把你唤醒"那一轮的 system prompt 标记
+（``astr_main_agent_resources.py:113``）。"""
+
+WAKE_HINT = (
+    "\n[后台任务结果]\n"
+    "这一轮是**后台任务跑完把你唤醒**的，不是用户新说的话，结果就在上面的 "
+    "BACKGROUND TASK CONTEXT 里。\n"
+    "要把结果告诉用户，**必须调用 `send_message_to_user`**——"
+    "这一轮你直接输出的文字用户看不到。\n"
+)
+"""唤醒轮的补充说明。
+
+框架自带的提示词是 "*Use* ``send_message_to_user`` *if needed*"（软措辞），
+而这一轮**只有**这一个投递通道：模型要是只输出一段文字，用户那边就是静默。
+我们在这里把"必须"说明白，比指望模型自己悟出来可靠。
+"""
 
 
 def strip_computer_use_notice(prompt: str) -> tuple[str, bool]:

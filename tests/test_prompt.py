@@ -77,3 +77,17 @@ def test_exec_hint_says_do_not_wait_and_no_shell():
 def test_skill_hint_points_at_read_skill():
     assert "read_skill" in SKILL_HINT
     assert "不用开沙箱" in SKILL_HINT
+
+
+def test_wake_hint_demands_send_message_to_user():
+    """唤醒轮只有 send_message_to_user 一个投递通道，必须说死。
+
+    框架自带的措辞是 "Use ... if needed"（软），模型要是只输出文字，
+    用户那边就是静默——这条守住"必须"。
+    """
+    from superbot.prompt import WAKE_HINT, WAKE_MARKER
+
+    assert WAKE_MARKER.startswith("# BACKGROUND TASK")
+    assert "send_message_to_user" in WAKE_HINT
+    assert "必须" in WAKE_HINT
+    assert "看不到" in WAKE_HINT
