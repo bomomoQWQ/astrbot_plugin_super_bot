@@ -274,6 +274,20 @@ def _port_open(host: str, port: int) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
+def _wait_port_free(host: str, port: int, *, timeout: float = 20.0) -> bool:
+    """等端口释放。
+
+    套件连着跑的时候，上一个实例刚 stop，操作系统未必立刻回收端口——
+    直接报"被占用"会让人误以为是残留进程。等一会儿再说。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_open(host, port):
+            return True
+        time.sleep(0.25)
+    return not _port_open(host, port)
+
+
 @dataclass
 class AstrBotInstance:
     """一个跑在子进程里的 AstrBot。"""
@@ -310,15 +324,16 @@ class AstrBotInstance:
         ensure_plugin_link()
 
         # 上一轮泄漏的进程会占着这两个端口，症状很隐蔽（新实例启动到一半退出，
-        # 日志里却是"配置没生效"）。所以先查，查到了就明确报错。
+        # 日志里却是"配置没生效"）。先等一会儿：套件连着跑时，上一个实例刚
+        # stop，端口未必立刻释放；等到超时才报错，并给出清理命令。
         for port, label in (
             (self.onebot_port, "OneBot"),
             (DASHBOARD_PORT, "Dashboard"),
         ):
-            if _port_open("127.0.0.1", port):
+            if not _wait_port_free("127.0.0.1", port, timeout=20.0):
                 raise RuntimeError(
-                    f"端口 {port}（{label}）已被占用，多半是上一轮 e2e 的残留进程。"
-                    f"先把它关掉再跑：Get-CimInstance Win32_Process | "
+                    f"端口 {port}（{label}）被占用 20 秒仍未释放，多半是上一轮 "
+                    f"e2e 的残留进程。先把它关掉再跑：Get-CimInstance Win32_Process | "
                     f"Where-Object {{ $_.CommandLine -like '*AstrBot*main.py*' }} | "
                     f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
                 )

@@ -136,16 +136,30 @@ async def run() -> int:
         )
 
         # --- 5. 模型通过工具派活 ------------------------------------------
+        # 注意：superbot_dispatch 现在是**后台任务**（ADR-14 配套改动），
+        # 所以这一轮模型拿到的是受理回执，结果由框架的唤醒轮带回来。
         bot.reset()
         await bot.send_group(
             "[[tool:superbot_dispatch]] 帮我算一下 6*7", user_id=20002, at=True
         )
-        echoed = await bot.wait_for_text("工具说：", timeout=45)
-        check(echoed is not None, "模型调用了 superbot_dispatch", env.log_tail(40))
+        ack = await bot.wait_for_text("工具说：", timeout=45)
+        check(ack is not None, "模型调用了 superbot_dispatch", env.log_tail(40))
         check(
-            echoed is not None and "ECHO-BATCH" in echoed,
-            "Worker 的结果真的回到了模型上下文",
-            str(echoed),
+            ack is not None and "Background task submitted" in ack,
+            "派活这一轮拿到的是后台受理回执（不再堵着等）",
+            str(ack),
+        )
+
+        # 结果必须**随后**自己回来：等日志里出现 worker done + 唤醒轮
+        deadline = asyncio.get_running_loop().time() + 60
+        while asyncio.get_running_loop().time() < deadline:
+            if "worker done ticket=" in env.log_text() and "ECHO-BATCH" in env.log_text():
+                break
+            await asyncio.sleep(0.5)
+        check(
+            "ECHO-BATCH" in env.log_text(),
+            "Worker 的结果真的回到了链路里",
+            env.log_tail(40),
         )
 
         log = env.log_text()
